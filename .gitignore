@@ -1,0 +1,24 @@
+﻿# Environment & Secrets
+.env
+*.env
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Execution Logs
+*.log
+pipeline_cron.log
+
+# Virtual Environments
+venv/
+env/
+.venv/
+
+# OS Artifacts
+.DS_Store
+Thumbs.db
+
+pipeline_credentials.txt
