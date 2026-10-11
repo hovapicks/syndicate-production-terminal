@@ -20,12 +20,14 @@ HEADERS = {
 ESPN_ENDPOINTS = {
     "NFL": "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
     "CFB": "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard",
-    "NHL": "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard",`n    "MLB": "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard",
+    "NHL": "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard",
+    "MLB": "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard",
     "WNBA": "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard"
 }
 
 def american_to_implied(odds):
-    if odds == 0: return 0.5
+    if odds == 0:
+        return 0.5
     return (100.0 / (odds + 100.0)) if odds > 0 else (abs(odds) / (abs(odds) + 100.0))
 
 def calculate_clv(book_odds, closing_odds):
@@ -33,17 +35,19 @@ def calculate_clv(book_odds, closing_odds):
         return 0.0
     p_book = american_to_implied(book_odds)
     p_close = american_to_implied(closing_odds)
-    if p_book == 0: return 0.0
-    # Beat-the-close edge formula
+    if p_book == 0:
+        return 0.0
     clv = ((p_close / p_book) - 1.0) * 100.0
     return round(clv, 2)
 
 def fetch_espn_scores(sport):
     url = ESPN_ENDPOINTS.get(sport)
-    if not url: return {}
+    if not url:
+        return {}
     try:
         r = requests.get(url, timeout=10)
-        if r.status_code != 200: return {}
+        if r.status_code != 200:
+            return {}
         data = r.json()
         results = {}
         for ev in data.get("events", []):
@@ -52,7 +56,8 @@ def fetch_espn_scores(sport):
             completed = comp.get("status", {}).get("type", {}).get("completed", False)
             
             competitors = comp.get("competitors", [])
-            if len(competitors) < 2: continue
+            if len(competitors) < 2:
+                continue
             
             home_team, away_team = None, None
             home_score, away_score = 0, 0
@@ -91,27 +96,24 @@ def grade_wager(entry, game_result):
     total_score = h_score + a_score
     score_str = f"{game_result['away_team']} {int(a_score)} - {game_result['home_team']} {int(h_score)}"
 
-    # Multiplier for calculating profit
     dec_payout = (odds / 100.0) if odds > 0 else (100.0 / abs(odds))
 
     if market == "Moneyline":
-        # Check team in pick
         home_win = h_score > a_score
         away_win = a_score > h_score
         if h_score == a_score:
             return "PUSH", 0.0, score_str
 
-        # Match team name/abbreviation
         is_home_pick = game_result["home_team"] in pick
         if (is_home_pick and home_win) or (not is_home_pick and away_win):
             return "WON", round(stake * dec_payout, 2), score_str
         else:
             return "LOST", -stake, score_str
 
-    elif market in ["Spread", "Puck Line"]:
-        # Extract spread number (e.g., +3.0, -1.5)
+    elif market in ["Spread", "Puck Line", "Run Line"]:
         m = re.search(r"([+-]?\d+(?:\.\d+)?)", pick)
-        if not m: return "OPEN", 0.0, ""
+        if not m:
+            return "OPEN", 0.0, ""
         spread_val = float(m.group(1))
         is_home = game_result["home_team"] in pick
         
@@ -127,7 +129,8 @@ def grade_wager(entry, game_result):
 
     elif market == "Total":
         m = re.search(r"(\d+(?:\.\d+)?)", pick)
-        if not m: return "OPEN", 0.0, ""
+        if not m:
+            return "OPEN", 0.0, ""
         line = float(m.group(1))
         is_over = "OVER" in pick.upper()
         
@@ -156,10 +159,8 @@ def run_settlement():
     settled_count = 0
     for bet in open_bets:
         sp = bet["sport"]
-        matchup = bet["matchup"].replace(" ", "").replace("@", "@")
         scores = score_registry.get(sp, {})
         
-        # Match game
         target_game = None
         for k, v in scores.items():
             if v["home_team"] in bet["matchup"] and v["away_team"] in bet["matchup"]:
