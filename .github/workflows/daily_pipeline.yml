@@ -2,9 +2,9 @@
 
 on:
   schedule:
-    # 08:00 UTC corresponds to 4:00 AM EDT
+    # 08:00 UTC = 4:00 AM EDT
     - cron: '0 8 * * *'
-  workflow_dispatch: # Allows manual trigger from GitHub UI anytime
+  workflow_dispatch:
 
 jobs:
   run-pipeline:
@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: setup-python@v5
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
