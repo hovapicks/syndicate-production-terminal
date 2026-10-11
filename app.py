@@ -9,7 +9,6 @@ load_dotenv()
 
 st.set_page_config(page_title="Syndicate Production Terminal", layout="wide", initial_sidebar_state="collapsed")
 
-# Prioritize Streamlit Cloud secrets over local environment variables
 def get_config(key, default=None):
     try:
         if key in st.secrets:
