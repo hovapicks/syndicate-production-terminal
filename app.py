@@ -14,16 +14,6 @@ st.markdown("""
 <style>
     .stApp { background-color: #0b111e; color: #d1d5db; }
     div[data-testid="stMetricValue"] { color: #f3f4f6; }
-    .rec-card {
-        background-color: #111827;
-        border: 1px solid #1f2937;
-        border-radius: 8px;
-        padding: 14px 18px;
-        margin-bottom: 12px;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-    }
     .badge-sport {
         display: inline-block;
         padding: 2px 8px;
@@ -63,7 +53,7 @@ def send_telegram_alert(sport, matchup, market, pick, odds, stake, ev):
         f"⚔️ *Matchup:* {matchup}\n"
         f"🎯 *Market:* {market}\n"
         f"⚡ *Pick:* {pick}\n"
-        f"📈 *Book Odds:* {odds}\n"
+        f"📈 *Book Odds:* {odds:+d} (American)\n"
         f"💰 *Stake:* {stake}u\n"
         f"💎 *EV:* +{ev}%\n\n"
         f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
@@ -85,13 +75,13 @@ def fetch_table(table_name):
 
 def record_wager(row_data, booked_odds, booked_units, bookmaker):
     payload = {
-        "sport": row_data["sport"],
-        "matchup": row_data["matchup"],
-        "market": row_data["market"],
-        "pick": row_data["pick"],
+        "sport": str(row_data["sport"]),
+        "matchup": str(row_data["matchup"]),
+        "market": str(row_data["market"]),
+        "pick": str(row_data["pick"]),
         "odds": int(booked_odds),
         "stake_units": float(booked_units),
-        "bookmaker": bookmaker,
+        "bookmaker": str(bookmaker),
         "status": "OPEN",
         "created_at": datetime.now(timezone.utc).isoformat()
     }
@@ -102,10 +92,11 @@ def record_wager(row_data, booked_odds, booked_units, bookmaker):
                 row_data["sport"], row_data["matchup"], row_data["market"],
                 row_data["pick"], booked_odds, booked_units, row_data["ev_percent"]
             )
-            return True
-    except Exception:
-        pass
-    return False
+            return True, "Success"
+        else:
+            return False, f"HTTP {r.status_code}: {r.text}"
+    except Exception as e:
+        return False, str(e)
 
 # Header & Controls
 st.markdown("<h2 style='margin-bottom:0;'>Syndicate Production Terminal</h2>", unsafe_allow_html=True)
@@ -127,7 +118,6 @@ with tabs[0]:
     df_recs = fetch_table("bet_recommendations")
 
     if not df_recs.empty:
-        # Sport selector
         sports_present = sorted(df_recs["sport"].unique().tolist())
         selected_sport = st.pills("Filter by Sport", ["ALL"] + sports_present, default="ALL")
 
@@ -136,7 +126,6 @@ with tabs[0]:
         if "staged_pick" not in st.session_state:
             st.session_state.staged_pick = None
 
-        # Display Staged Wager Action Panel if a bet is selected
         if st.session_state.staged_pick:
             stg = st.session_state.staged_pick
             with st.container():
@@ -159,12 +148,13 @@ with tabs[0]:
                     st.write("")
                     st.write("")
                     if st.button("✅ Commit to Ledger", use_container_width=True, type="primary"):
-                        if record_wager(stg, b_odds, b_stake, book_name):
+                        success, msg = record_wager(stg, b_odds, b_stake, book_name)
+                        if success:
                             st.success(f"Locked {stg['pick']} ({b_stake}u) to Ledger & dispatched alert!")
                             st.session_state.staged_pick = None
                             st.rerun()
                         else:
-                            st.error("Failed to commit wager to database.")
+                            st.error(f"Commit Failed: {msg}")
                 with col_b5:
                     st.write("")
                     st.write("")
@@ -172,7 +162,6 @@ with tabs[0]:
                         st.session_state.staged_pick = None
                         st.rerun()
 
-        # Render Active Bets Table with Row-Level Action Buttons
         for idx, row in view_df.iterrows():
             c1, c2, c3, c4, c5, c6, c7 = st.columns([1.2, 2.5, 2.2, 1.3, 1.3, 1.4, 1.5])
             with c1:
@@ -217,7 +206,6 @@ with tabs[1]:
 # ==============================================================================
 with tabs[2]:
     st.subheader("Closing Line Value (CLV) Performance Audit")
-    st.caption("Tracks line movement delta between entry price and final closing consensus.")
     df_ledger = fetch_table("ledger_entries")
     if not df_ledger.empty:
         col_m1, col_m2, col_m3 = st.columns(3)
