@@ -34,6 +34,24 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# Master list of active books across your desk
+BOOKMAKERS = [
+    "DraftKings",
+    "FanDuel",
+    "BetMGM",
+    "Caesars",
+    "bet365",
+    "theScore",
+    "Bally Bet",
+    "Fanatics",
+    "BetOnline",
+    "Novig",
+    "Kalshi",
+    "Circa",
+    "Pinnacle",
+    "Other"
+]
+
 HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -141,7 +159,7 @@ with tabs[0]:
                 with col_b2:
                     b_stake = st.number_input("Stake Units", value=float(stg["suggested_stake"]), min_value=0.25, step=0.25, key="stage_stake")
                 with col_b3:
-                    book_name = st.selectbox("Bookmaker", ["DraftKings", "FanDuel", "BetMGM", "Caesars", "Circa", "Pinnacle"], key="stage_book")
+                    book_name = st.selectbox("Bookmaker", BOOKMAKERS, key="stage_book")
                 with col_b4:
                     st.write("")
                     st.write("")
@@ -199,7 +217,7 @@ with tabs[1]:
             m_pick = st.text_input("Pick", placeholder="KC +3.0")
             m_odds = st.number_input("Odds (American)", value=-110, step=1)
             m_stake = st.number_input("Stake Units", value=1.00, min_value=0.25, step=0.25)
-            m_book = st.selectbox("Bookmaker", ["DraftKings", "FanDuel", "BetMGM", "Caesars", "Circa", "Pinnacle"])
+            m_book = st.selectbox("Bookmaker", BOOKMAKERS, key="manual_book")
             
             if st.button("Submit Manual Wager", type="primary", use_container_width=True):
                 if m_matchup and m_pick:
