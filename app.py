@@ -1,7 +1,7 @@
 ﻿import os
 import streamlit as st
 import pandas as pd
-import sqlalchemy as sa
+import requests
 from dotenv import load_dotenv
 from notifier import dispatch_wager_alert
 
@@ -17,13 +17,15 @@ def get_config(key, default=None):
         pass
     return os.getenv(key, default)
 
-DATABASE_URL = get_config("DATABASE_URL")
+SUPABASE_URL = get_config("SUPABASE_URL", "https://btzzkdnijzzdqvjnomr.supabase.co").rstrip("/")
+SUPABASE_KEY = get_config("SUPABASE_KEY", "")
 
-@st.cache_resource
-def get_engine():
-    return sa.create_engine(DATABASE_URL, pool_pre_ping=True)
-
-engine = get_engine()
+HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=representation"
+}
 
 st.title("Syndicate Production Terminal")
 
@@ -39,10 +41,11 @@ with tab_recs:
             st.rerun()
 
     try:
-        with engine.connect() as conn:
-            df = pd.read_sql("SELECT * FROM bet_recommendations WHERE status = 'ACTIVE' ORDER BY ev_percent DESC", conn)
+        url = f"{SUPABASE_URL}/rest/v1/bet_recommendations?status=eq.ACTIVE&order=ev_percent.desc"
+        res = requests.get(url, headers=HEADERS, timeout=10)
         
-        if not df.empty:
+        if res.status_code == 200 and res.json():
+            df = pd.DataFrame(res.json())
             sports = list(df["sport"].unique())
             selected_sports = st.pills("Filter by Sport", sports, selection_mode="multi", default=sports)
             filtered_df = df[df["sport"].isin(selected_sports)] if selected_sports else df
@@ -67,27 +70,30 @@ with tab_ledger:
         
         submit = st.form_submit_button("Commit Wager to Ledger & Dispatch Alerts")
         if submit:
+            payload = {
+                "sport": f_sport,
+                "matchup": f_matchup,
+                "market": f_market,
+                "pick": f_pick,
+                "bookmaker": f_book,
+                "locked_odds": int(f_odds),
+                "stake": float(f_stake),
+                "ev_percent": float(f_ev),
+                "status": "PENDING"
+            }
             try:
-                with engine.begin() as conn:
-                    conn.execute(sa.text("""
-                        INSERT INTO wagers (sport, matchup, market, pick, bookmaker, locked_odds, stake, ev_percent, status)
-                        VALUES (:sport, :matchup, :market, :pick, :bookmaker, :locked_odds, :stake, :ev_percent, 'PENDING')
-                    """), {
-                        "sport": f_sport,
-                        "matchup": f_matchup,
-                        "market": f_market,
-                        "pick": f_pick,
-                        "bookmaker": f_book,
-                        "locked_odds": f_odds,
-                        "stake": f_stake,
-                        "ev_percent": f_ev
-                    })
-                st.success("Wager successfully committed to Supabase ledger.")
-                res = dispatch_wager_alert(f_sport, f_pick, f_book, f_odds, f_stake, f_ev)
-                if res["email"][0]:
-                    st.info(res["email"][1])
-                if res["telegram"][0]:
-                    st.info(res["telegram"][1])
+                post_url = f"{SUPABASE_URL}/rest/v1/wagers"
+                post_res = requests.post(post_url, headers=HEADERS, json=payload, timeout=10)
+                
+                if post_res.status_code in [200, 201]:
+                    st.success("Wager successfully committed to Supabase ledger.")
+                    res_alert = dispatch_wager_alert(f_sport, f_pick, f_book, f_odds, f_stake, f_ev)
+                    if res_alert["email"][0]:
+                        st.info(res_alert["email"][1])
+                    if res_alert["telegram"][0]:
+                        st.info(res_alert["telegram"][1])
+                else:
+                    st.error(f"Failed to record wager: HTTP {post_res.status_code} - {post_res.text}")
             except Exception as e:
                 st.error(f"Failed to record wager: {e}")
 
@@ -95,9 +101,10 @@ with tab_ledger:
 with tab_clv:
     st.subheader("Closing Line Value (CLV) Performance Ledger")
     try:
-        with engine.connect() as conn:
-            df_ledger = pd.read_sql("SELECT * FROM wagers ORDER BY created_at DESC", conn)
-        if not df_ledger.empty:
+        ledger_url = f"{SUPABASE_URL}/rest/v1/wagers?order=created_at.desc"
+        res_ledger = requests.get(ledger_url, headers=HEADERS, timeout=10)
+        if res_ledger.status_code == 200 and res_ledger.json():
+            df_ledger = pd.DataFrame(res_ledger.json())
             st.dataframe(df_ledger, use_container_width=True, hide_index=True)
         else:
             st.info("No wagers recorded yet.")
