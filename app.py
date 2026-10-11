@@ -10,7 +10,6 @@ load_dotenv()
 
 st.set_page_config(page_title="Syndicate Production Terminal", layout="wide", initial_sidebar_state="collapsed")
 
-# Custom Dark Terminal Styling
 st.markdown("""
 <style>
     .stApp { background-color: #0b111e; color: #d1d5db; }
@@ -34,22 +33,10 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Master list of active books across your desk
 BOOKMAKERS = [
-    "DraftKings",
-    "FanDuel",
-    "BetMGM",
-    "Caesars",
-    "bet365",
-    "theScore",
-    "Bally Bet",
-    "Fanatics",
-    "BetOnline",
-    "Novig",
-    "Kalshi",
-    "Circa",
-    "Pinnacle",
-    "Other"
+    "DraftKings", "FanDuel", "BetMGM", "Caesars", "bet365",
+    "theScore", "Bally Bet", "Fanatics", "BetOnline", "Novig",
+    "Kalshi", "Circa", "Pinnacle", "Other"
 ]
 
 HEADERS = {
@@ -58,6 +45,17 @@ HEADERS = {
     "Content-Type": "application/json",
     "Prefer": "return=representation"
 }
+
+def american_to_decimal(amer):
+    if amer > 0:
+        return (amer / 100.0) + 1.0
+    else:
+        return (100.0 / abs(amer)) + 1.0
+
+def calculate_dynamic_ev(fair_prob, entered_odds):
+    dec = american_to_decimal(entered_odds)
+    ev = (fair_prob * dec) - 1.0
+    return round(ev * 100.0, 2)
 
 def send_telegram_alert(sport, matchup, market, pick, odds, stake, ev="MANUAL"):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
@@ -88,7 +86,7 @@ def fetch_table(table_name):
         pass
     return pd.DataFrame()
 
-def record_wager(row_data, booked_odds, booked_units, bookmaker):
+def record_wager(row_data, booked_odds, booked_units, bookmaker, calculated_ev="MANUAL"):
     payload = {
         "sport": str(row_data["sport"]),
         "matchup": str(row_data["matchup"]),
@@ -103,10 +101,9 @@ def record_wager(row_data, booked_odds, booked_units, bookmaker):
     try:
         r = requests.post(f"{SUPABASE_URL}/rest/v1/ledger_entries", headers=HEADERS, json=payload, timeout=8)
         if r.status_code in [200, 201]:
-            ev_val = row_data.get("ev_percent", "MANUAL")
             send_telegram_alert(
                 row_data["sport"], row_data["matchup"], row_data["market"],
-                row_data["pick"], booked_odds, booked_units, ev_val
+                row_data["pick"], booked_odds, booked_units, calculated_ev
             )
             return True, "Success"
         else:
@@ -114,14 +111,13 @@ def record_wager(row_data, booked_odds, booked_units, bookmaker):
     except Exception as e:
         return False, str(e)
 
-# Layout Setup
 st.markdown("<h2 style='margin-bottom:0;'>Syndicate Production Terminal</h2>", unsafe_allow_html=True)
 st.caption("Quantitative Multi-Sport Desk • Quarter-Kelly Sizing • Autonomous Cloud Pipeline")
 
 tabs = st.tabs(["Active Model Recommendations", "Execution Ledger", "CLV & Settlement Audit"])
 
 # ==============================================================================
-# TAB 1: RECOMMENDATIONS + 1-CLICK BET STAGER
+# TAB 1: RECOMMENDATIONS + DYNAMIC EV STAGER
 # ==============================================================================
 with tabs[0]:
     col_t1, col_t2 = st.columns([4, 1])
@@ -147,7 +143,7 @@ with tabs[0]:
             with st.container():
                 st.markdown(f"""
                 <div style="background: rgba(37, 99, 235, 0.12); border: 1px solid #2563eb; border-radius: 6px; padding: 14px 18px; margin-bottom: 20px;">
-                    <div style="font-weight: 700; color: #93c5fd; font-size: 14px; margin-bottom: 8px;">
+                    <div style="font-weight: 700; color: #93c5fd; font-size: 14px; margin-bottom: 4px;">
                         ⚡ CONFIRM & STAGE WAGER: {stg['sport']} • {stg['matchup']} • {stg['pick']}
                     </div>
                 </div>
@@ -160,11 +156,19 @@ with tabs[0]:
                     b_stake = st.number_input("Stake Units", value=float(stg["suggested_stake"]), min_value=0.25, step=0.25, key="stage_stake")
                 with col_b3:
                     book_name = st.selectbox("Bookmaker", BOOKMAKERS, key="stage_book")
+
+                # Dynamic EV Calculation if model probability is available
+                fair_p = float(stg.get("fair_prob", 0.0))
+                if fair_p > 0:
+                    live_ev = calculate_dynamic_ev(fair_p, b_odds)
+                    ev_color = "#10b981" if live_ev >= 2.0 else "#f59e0b" if live_ev > 0 else "#ef4444"
+                    st.markdown(f"<span style='color:{ev_color}; font-weight:600; font-size:13px;'>Live Recalculated EV: {live_ev:+g}%</span>", unsafe_allow_html=True)
+                else:
+                    live_ev = stg.get("ev_percent", "MANUAL")
+
                 with col_b4:
-                    st.write("")
-                    st.write("")
                     if st.button("✅ Commit to Ledger", use_container_width=True, type="primary"):
-                        success, msg = record_wager(stg, b_odds, b_stake, book_name)
+                        success, msg = record_wager(stg, b_odds, b_stake, book_name, live_ev)
                         if success:
                             st.success(f"Locked {stg['pick']} ({b_stake}u) to Ledger & dispatched alert!")
                             st.session_state.staged_pick = None
@@ -172,8 +176,6 @@ with tabs[0]:
                         else:
                             st.error(f"Commit Failed: {msg}")
                 with col_b5:
-                    st.write("")
-                    st.write("")
                     if st.button("✖ Cancel", use_container_width=True):
                         st.session_state.staged_pick = None
                         st.rerun()
@@ -225,10 +227,9 @@ with tabs[1]:
                         "sport": m_sport,
                         "matchup": m_matchup.strip().upper(),
                         "market": m_market,
-                        "pick": m_pick.strip(),
-                        "ev_percent": "MANUAL"
+                        "pick": m_pick.strip()
                     }
-                    success, msg = record_wager(payload, m_odds, m_stake, m_book)
+                    success, msg = record_wager(payload, m_odds, m_stake, m_book, "MANUAL")
                     if success:
                         st.success(f"Logged {m_pick} ({m_stake}u) successfully!")
                         st.rerun()
