@@ -1,12 +1,14 @@
 ﻿import os
 import requests
-import pandas as pd
+import datetime
 from dotenv import load_dotenv
+
 from models.nfl_pipeline import generate_nfl_recommendations
 from models.nhl_pipeline import generate_nhl_recommendations
 from models.epl_pipeline import generate_epl_recommendations
 from models.cfb_pipeline import generate_cfb_recommendations
 from models.wnba_pipeline import generate_wnba_recommendations
+from models.mlb_pipeline import generate_mlb_recommendations
 
 load_dotenv()
 
@@ -20,73 +22,88 @@ HEADERS = {
     "Prefer": "return=representation"
 }
 
-def run_pipeline():
-    print("[*] Initiating Autonomous Syndicate Pipeline Worker (5-Sport Engine)...")
+def sync_pipeline():
+    print(f"[*] Starting 6-Sport Quantitative Syndicate Production Run: {datetime.datetime.utcnow().isoformat()}Z")
+    
     all_recs = []
-
-    # 1. NFL Engine
+    
+    # 1. NFL
     try:
-        print("[*] Running NFL quantitative engine...")
-        nfl_recs = generate_nfl_recommendations()
-        print(f"[✓] NFL generated {len(nfl_recs)} verified plays.")
-        all_recs.extend(nfl_recs)
+        print("[*] Generating NFL positions...")
+        nfl_plays = generate_nfl_recommendations()
+        print(f"[✓] NFL generated: {len(nfl_plays)} edges.")
+        all_recs.extend(nfl_plays)
     except Exception as e:
-        print(f"[!] NFL pipeline error: {e}")
+        print(f"[!] NFL Pipeline Exception: {e}")
 
-    # 2. NHL Engine
+    # 2. NHL
     try:
-        print("[*] Running NHL Dixon-Coles engine...")
-        nhl_recs = generate_nhl_recommendations()
-        print(f"[✓] NHL generated {len(nhl_recs)} verified plays.")
-        all_recs.extend(nhl_recs)
+        print("[*] Generating NHL positions...")
+        nhl_plays = generate_nhl_recommendations()
+        print(f"[✓] NHL generated: {len(nhl_plays)} edges.")
+        all_recs.extend(nhl_plays)
     except Exception as e:
-        print(f"[!] NHL pipeline error: {e}")
+        print(f"[!] NHL Pipeline Exception: {e}")
 
-    # 3. EPL Engine
+    # 3. EPL
     try:
-        print("[*] Running EPL quantitative engine...")
-        epl_recs = generate_epl_recommendations()
-        print(f"[✓] EPL generated {len(epl_recs)} verified plays.")
-        all_recs.extend(epl_recs)
+        print("[*] Generating EPL positions...")
+        epl_plays = generate_epl_recommendations()
+        print(f"[✓] EPL generated: {len(epl_plays)} edges.")
+        all_recs.extend(epl_plays)
     except Exception as e:
-        print(f"[!] EPL pipeline error: {e}")
+        print(f"[!] EPL Pipeline Exception: {e}")
 
-    # 4. CFB Engine
+    # 4. CFB
     try:
-        print("[*] Running NCAA CFB quantitative engine...")
-        cfb_recs = generate_cfb_recommendations()
-        print(f"[✓] CFB generated {len(cfb_recs)} verified plays.")
-        all_recs.extend(cfb_recs)
+        print("[*] Generating CFB positions...")
+        cfb_plays = generate_cfb_recommendations()
+        print(f"[✓] CFB generated: {len(cfb_plays)} edges.")
+        all_recs.extend(cfb_plays)
     except Exception as e:
-        print(f"[!] CFB pipeline error: {e}")
+        print(f"[!] CFB Pipeline Exception: {e}")
 
-    # 5. WNBA Engine
+    # 5. WNBA
     try:
-        print("[*] Running WNBA recency-weighted engine...")
-        wnba_recs = generate_wnba_recommendations()
-        print(f"[✓] WNBA generated {len(wnba_recs)} verified plays.")
-        all_recs.extend(wnba_recs)
+        print("[*] Generating WNBA positions...")
+        wnba_plays = generate_wnba_recommendations()
+        print(f"[✓] WNBA generated: {len(wnba_plays)} edges.")
+        all_recs.extend(wnba_plays)
     except Exception as e:
-        print(f"[!] WNBA pipeline error: {e}")
+        print(f"[!] WNBA Pipeline Exception: {e}")
 
-    # 6. Atomic Push to Supabase PostgREST
+    # 6. MLB Postseason
+    try:
+        print("[*] Generating MLB Postseason positions...")
+        mlb_plays = generate_mlb_recommendations()
+        print(f"[✓] MLB generated: {len(mlb_plays)} edges.")
+        all_recs.extend(mlb_plays)
+    except Exception as e:
+        print(f"[!] MLB Pipeline Exception: {e}")
+
+    print(f"[*] Total Qualified Syndicate Recommendations: {len(all_recs)}")
+
+    # Wipe existing table and insert fresh production recommendations
+    print("[*] Syncing recommendations to Supabase...")
+    del_r = requests.delete(
+        f"{SUPABASE_URL}/rest/v1/bet_recommendations?id=neq.00000000-0000-0000-0000-000000000000",
+        headers=HEADERS,
+        timeout=10
+    )
+    
     if all_recs:
-        df = pd.DataFrame(all_recs).sort_values(by="ev_percent", ascending=False)
-        df = df.drop_duplicates(subset=["sport", "matchup", "market", "pick"])
-        clean_recs = df.to_dict(orient="records")
-
-        requests.delete(
-            f"{SUPABASE_URL}/rest/v1/bet_recommendations?id=neq.00000000-0000-0000-0000-000000000000",
-            headers=HEADERS
-        )
-        post_res = requests.post(
+        ins_r = requests.post(
             f"{SUPABASE_URL}/rest/v1/bet_recommendations",
             headers=HEADERS,
-            json=clean_recs
+            json=all_recs,
+            timeout=10
         )
-        print(f"[✓] Synced {len(clean_recs)} total multi-sport plays across NFL, NHL, EPL, CFB, and WNBA to Supabase (Status: {post_res.status_code}).")
+        if ins_r.status_code in [200, 201]:
+            print(f"[✓] Successfully committed {len(all_recs)} edges to Supabase.")
+        else:
+            print(f"[!] Supabase Insert Error {ins_r.status_code}: {ins_r.text}")
     else:
-        print("[!] No active edges cleared the strict syndicate hurdles across slates.")
+        print("[*] No qualifying plays across current slate.")
 
 if __name__ == "__main__":
-    run_pipeline()
+    sync_pipeline()

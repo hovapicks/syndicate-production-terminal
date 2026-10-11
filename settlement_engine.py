@@ -20,7 +20,7 @@ HEADERS = {
 ESPN_ENDPOINTS = {
     "NFL": "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
     "CFB": "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard",
-    "NHL": "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard",
+    "NHL": "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard",`n    "MLB": "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard",
     "WNBA": "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard"
 }
 
