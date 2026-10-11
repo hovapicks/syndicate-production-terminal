@@ -1,5 +1,4 @@
 ﻿import os
-import subprocess
 import streamlit as st
 import pandas as pd
 import sqlalchemy as sa
@@ -8,10 +7,18 @@ from notifier import dispatch_wager_alert
 
 load_dotenv()
 
-st.set_page_config(page_title="Syndicate Production Terminal", layout="wide")
-st.title("Syndicate Production Terminal")
+st.set_page_config(page_title="Syndicate Production Terminal", layout="wide", initial_sidebar_state="collapsed")
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# Prioritize Streamlit Cloud secrets over local environment variables
+def get_config(key, default=None):
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return os.getenv(key, default)
+
+DATABASE_URL = get_config("DATABASE_URL")
 
 @st.cache_resource
 def get_engine():
@@ -19,167 +26,81 @@ def get_engine():
 
 engine = get_engine()
 
-tabs = st.tabs(["Active Model Recommendations", "Execution Ledger", "CLV Audit"])
+st.title("Syndicate Production Terminal")
 
-# TAB 1: MODEL RECOMMENDATIONS
-with tabs[0]:
-    col1, col2 = st.columns([4, 1])
-    with col1:
+tab_recs, tab_ledger, tab_clv = st.tabs(["Active Model Recommendations", "Execution Ledger", "CLV Audit"])
+
+# --- TAB 1: RECOMMENDATIONS ---
+with tab_recs:
+    col_t, col_btn = st.columns([6, 1])
+    with col_t:
         st.subheader("Daily Model Edge Recommendations")
-    with col2:
-        if st.button("🔄 Sync Live Slate"):
-            with st.spinner("Fetching latest odds and running syndicate model..."):
-                subprocess.run(["python", "pipeline_worker.py"], capture_output=True, text=True)
-                st.success("Slate synchronized!")
-                st.rerun()
+    with col_btn:
+        if st.button("🔄 Sync Live Slate", use_container_width=True):
+            st.rerun()
 
     try:
         with engine.connect() as conn:
-            df_recs = pd.read_sql_query(
-                sa.text("""
-                    SELECT 
-                        id::text AS id, 
-                        sport, 
-                        matchup, 
-                        market, 
-                        pick, 
-                        fair_odds, 
-                        book_odds, 
-                        ev_percent, 
-                        suggested_stake, 
-                        status, 
-                        created_at 
-                    FROM bet_recommendations 
-                    ORDER BY created_at DESC
-                """),
-                conn
-            )
-        if not df_recs.empty:
-            available_sports = sorted(df_recs["sport"].unique().tolist())
-            selected_sports = st.multiselect("Filter by Sport", available_sports, default=available_sports)
-            filtered_df = df_recs[df_recs["sport"].isin(selected_sports)]
-            st.dataframe(filtered_df, use_container_width=True)
+            df = pd.read_sql("SELECT * FROM bet_recommendations WHERE status = 'ACTIVE' ORDER BY ev_percent DESC", conn)
+        
+        if not df.empty:
+            sports = list(df["sport"].unique())
+            selected_sports = st.pills("Filter by Sport", sports, selection_mode="multi", default=sports)
+            filtered_df = df[df["sport"].isin(selected_sports)] if selected_sports else df
+            st.dataframe(filtered_df, use_container_width=True, hide_index=True)
         else:
-            st.info("No active recommendations currently in Supabase. Click 'Sync Live Slate' to load.")
-    except Exception as e:
-        st.error(f"Error loading recommendations: {e}")
+            st.info("No active recommendations currently logged for today's slate.")
+    except Exception as exc:
+        st.error(f"Error loading recommendations: {exc}")
 
-# TAB 2: EXECUTION LEDGER
-with tabs[1]:
-    st.subheader("Wager Execution Ledger")
-    with st.form("ledger_entry_form"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            sport = st.selectbox("Sport", ["NFL", "NHL", "EPL", "CFB", "MLB", "WNBA", "CBB"])
-            pick = st.text_input("Pick / Selection", value="IND +2.5")
-        with c2:
-            book = st.selectbox("Sportsbook", ["DraftKings", "FanDuel", "BetMGM", "Caesars", "Circa", "Pinnacle"])
-            locked_line = st.number_input("Locked Line", value=2.5, step=0.5)
-        with c3:
-            locked_odds = st.number_input("Locked American Odds", value=-105, step=5)
-            stake = st.number_input("Staked Units", value=1.25, min_value=0.10, step=0.25)
-            
-        submitted = st.form_submit_button("Commit Wager to Ledger & Dispatch Alerts")
-        if submitted:
+# --- TAB 2: EXECUTION LEDGER ---
+with tab_ledger:
+    st.subheader("Log Executed Position")
+    with st.form("wager_entry_form"):
+        f_sport = st.selectbox("Sport", ["NFL", "NHL", "EPL", "CFB"])
+        f_matchup = st.text_input("Matchup", placeholder="e.g. Houston Texans @ Tennessee Titans")
+        f_market = st.selectbox("Market Type", ["Spread", "Moneyline", "Total"])
+        f_pick = st.text_input("Selection", placeholder="e.g. Houston Texans -7")
+        f_book = st.selectbox("Sportsbook", ["DraftKings", "FanDuel", "BetMGM", "Caesars", "Circa", "Pinnacle"])
+        f_odds = st.number_input("Book Odds (American)", value=-110, step=1)
+        f_stake = st.number_input("Allocated Stake (Units)", value=1.25, step=0.25)
+        f_ev = st.number_input("Estimated Edge (% EV)", value=4.0, step=0.1)
+        
+        submit = st.form_submit_button("Commit Wager to Ledger & Dispatch Alerts")
+        if submit:
             try:
                 with engine.begin() as conn:
-                    conn.execute(
-                        sa.text("""
-                            INSERT INTO bet_ledger (sport, pick, sportsbook, locked_line, locked_odds, staked_units, status)
-                            VALUES (:sport, :pick, :book, :line, :odds, :stake, 'PENDING')
-                        """),
-                        {"sport": sport, "pick": pick, "book": book, "line": locked_line, "odds": locked_odds, "stake": stake}
-                    )
-                st.success(f"Wager locked: {sport} | {pick} ({locked_odds:+d}) for {stake:.2f}u on {book}")
-                
-                # Phase 6: Multi-Channel Alert Dispatch
-                results = dispatch_wager_alert(sport, pick, book, locked_odds, stake)
-                email_ok, email_msg = results["email"]
-                tg_ok, tg_msg = results["telegram"]
-                
-                if email_ok:
-                    st.info(f"📧 {email_msg}")
-                else:
-                    st.warning(f"📧 {email_msg}")
-                    
-                if tg_ok:
-                    st.info(f"📱 {tg_msg}")
-                else:
-                    st.caption(f"📱 Telegram: {tg_msg}")
-                    
-                st.rerun()
-            except Exception as ex:
-                st.error(f"Commit failed: {ex}")
+                    conn.execute(sa.text("""
+                        INSERT INTO wagers (sport, matchup, market, pick, bookmaker, locked_odds, stake, ev_percent, status)
+                        VALUES (:sport, :matchup, :market, :pick, :bookmaker, :locked_odds, :stake, :ev_percent, 'PENDING')
+                    """), {
+                        "sport": f_sport,
+                        "matchup": f_matchup,
+                        "market": f_market,
+                        "pick": f_pick,
+                        "bookmaker": f_book,
+                        "locked_odds": f_odds,
+                        "stake": f_stake,
+                        "ev_percent": f_ev
+                    })
+                st.success("Wager successfully committed to Supabase ledger.")
+                res = dispatch_wager_alert(f_sport, f_pick, f_book, f_odds, f_stake, f_ev)
+                if res["email"][0]:
+                    st.info(res["email"][1])
+                if res["telegram"][0]:
+                    st.info(res["telegram"][1])
+            except Exception as e:
+                st.error(f"Failed to record wager: {e}")
 
-# TAB 3: CLV AUDIT
-with tabs[2]:
-    st.subheader("Closing Line Value (CLV) Audit")
+# --- TAB 3: CLV AUDIT ---
+with tab_clv:
+    st.subheader("Closing Line Value (CLV) Performance Ledger")
     try:
         with engine.connect() as conn:
-            df_ledger = pd.read_sql_query(
-                sa.text("""
-                    SELECT 
-                        id::text AS id, 
-                        sport, 
-                        pick, 
-                        sportsbook, 
-                        locked_line, 
-                        locked_odds, 
-                        staked_units, 
-                        closing_line, 
-                        clv, 
-                        status, 
-                        created_at 
-                    FROM bet_ledger 
-                    ORDER BY created_at DESC
-                """),
-                conn
-            )
-        
+            df_ledger = pd.read_sql("SELECT * FROM wagers ORDER BY created_at DESC", conn)
         if not df_ledger.empty:
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Total Active Exposure", f"{df_ledger['staked_units'].sum():.2f}u")
-            m2.metric("Total Wagers Logged", len(df_ledger))
-            m3.metric("Avg CLV %", f"{df_ledger['clv'].mean():.2f}%" if df_ledger['clv'].notnull().any() else "Pending Game Close")
-            
-            st.dataframe(df_ledger, use_container_width=True)
-            
-            st.markdown("---")
-            st.subheader("Update Closing Line & Settle CLV")
-            with st.form("clv_update_form"):
-                sc1, sc2, sc3 = st.columns(3)
-                with sc1:
-                    ticket_id = st.selectbox("Select Ticket ID", df_ledger["id"].tolist())
-                with sc2:
-                    closing_line = st.number_input("Closing Line / Number", value=0.0, step=0.5)
-                    closing_odds = st.number_input("Closing American Odds", value=-110, step=5)
-                with sc3:
-                    new_status = st.selectbox("Grade Status", ["PENDING", "WON", "LOST", "PUSH"])
-                    
-                update_btn = st.form_submit_button("Settle & Calculate CLV")
-                if update_btn:
-                    row = df_ledger[df_ledger["id"] == ticket_id].iloc[0]
-                    locked_o = float(row["locked_odds"])
-                    
-                    def to_implied(o):
-                        return 100 / (o + 100) if o > 0 else abs(o) / (abs(o) + 100)
-                    
-                    p_locked = to_implied(locked_o)
-                    p_closing = to_implied(closing_odds)
-                    clv_val = round(((p_closing / p_locked) - 1.0) * 100.0, 2)
-                    
-                    with engine.begin() as conn:
-                        conn.execute(
-                            sa.text("""
-                                UPDATE bet_ledger 
-                                SET closing_line = :cl, clv = :clv, status = :st 
-                                WHERE id::text = :id
-                            """),
-                            {"cl": closing_line, "clv": clv_val, "st": new_status, "id": ticket_id}
-                        )
-                    st.success(f"Ticket {ticket_id[:8]} updated! CLV: {clv_val:+0.2f}% | Status: {new_status}")
-                    st.rerun()
+            st.dataframe(df_ledger, use_container_width=True, hide_index=True)
         else:
-            st.info("No wager records committed to Supabase yet.")
-    except Exception as e:
-        st.error(f"Error loading ledger: {e}")
+            st.info("No wagers recorded yet.")
+    except Exception as exc:
+        st.error(f"Error fetching ledger: {exc}")
