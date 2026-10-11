@@ -87,11 +87,11 @@ def prob_to_american(p):
     if p <= 0.0001 or p >= 0.9999: return -110
     return int(round(-((p / (1.0 - p)) * 100))) if p >= 0.5 else int(round(((1.0 - p) / p) * 100))
 
-def half_kelly(fair_p, market_odds):
+def quarter_kelly(fair_p, market_odds):
     b = (market_odds / 100.0) if market_odds > 0 else (100.0 / abs(market_odds))
     q = 1.0 - fair_p
     f = (b * fair_p - q) / b
-    return round(max(0.0, min(3.0, (f / 2.0) * 100.0)), 2)
+    return round(max(0.0, min(3.0, (f * 0.25) * 100.0)), 2)
 
 def tau_dixon_coles(x, y, lambda_h, lambda_a, rho=DIXON_COLES_RHO):
     if x == 0 and y == 0:
@@ -242,7 +242,6 @@ def simulate_dixon_coles(home, away, h_b2b, a_b2b, mkt_tot, crease_map):
 
     grid = grid / np.sum(grid)
 
-    # Empty-Net Goal Markov State Adjustment (+31.5% Transition Rate)
     adjusted_grid = grid.copy()
     ENG_TRANSITION_RATE = 0.315
     for x in range(max_g - 1):
@@ -313,17 +312,13 @@ def generate_nhl_recommendations():
         sim = simulate_dixon_coles(h_abbr, a_abbr, h_b2b, a_b2b, tot, crease_map)
         fair_mkt_a, fair_mkt_h = devig_power_ratio(a_ml, h_ml)
 
-        # ----------------------------------------------------------------------
-        # Evaluate Side Candidates (Moneyline vs Puck Line)
-        # ----------------------------------------------------------------------
         side_candidates = []
 
-        # ML Options
         eh_ml = (sim["h_ml_p"] - fair_mkt_h) * 100.0
         ea_ml = (sim["a_ml_p"] - fair_mkt_a) * 100.0
 
         if eh_ml >= 2.5:
-            stake = half_kelly(sim["h_ml_p"], h_ml)
+            stake = quarter_kelly(sim["h_ml_p"], h_ml)
             side_candidates.append({
                 "sport": "NHL",
                 "matchup": f"{a_abbr} @ {h_abbr}",
@@ -332,11 +327,11 @@ def generate_nhl_recommendations():
                 "fair_odds": prob_to_american(sim["h_ml_p"]),
                 "book_odds": h_ml,
                 "ev_percent": round(eh_ml, 1),
-                "suggested_stake": stake if stake > 0 else 1.0,
+                "suggested_stake": stake if stake > 0 else 0.75,
                 "status": "ACTIVE"
             })
         if ea_ml >= 2.5:
-            stake = half_kelly(sim["a_ml_p"], a_ml)
+            stake = quarter_kelly(sim["a_ml_p"], a_ml)
             side_candidates.append({
                 "sport": "NHL",
                 "matchup": f"{a_abbr} @ {h_abbr}",
@@ -345,17 +340,16 @@ def generate_nhl_recommendations():
                 "fair_odds": prob_to_american(sim["a_ml_p"]),
                 "book_odds": a_ml,
                 "ev_percent": round(ea_ml, 1),
-                "suggested_stake": stake if stake > 0 else 1.0,
+                "suggested_stake": stake if stake > 0 else 0.75,
                 "status": "ACTIVE"
             })
 
-        # Puck Line Options
         is_home_fav = h_ml <= a_ml
         if is_home_fav:
             edge_h_minus = (sim["h_minus_15_p"] - american_to_implied(h_pl)) * 100.0
             edge_a_plus = (sim["a_plus_15_p"] - american_to_implied(a_pl)) * 100.0
             if edge_h_minus >= 2.5:
-                stake = half_kelly(sim["h_minus_15_p"], h_pl)
+                stake = quarter_kelly(sim["h_minus_15_p"], h_pl)
                 side_candidates.append({
                     "sport": "NHL",
                     "matchup": f"{a_abbr} @ {h_abbr}",
@@ -364,11 +358,11 @@ def generate_nhl_recommendations():
                     "fair_odds": prob_to_american(sim["h_minus_15_p"]),
                     "book_odds": h_pl,
                     "ev_percent": round(edge_h_minus, 1),
-                    "suggested_stake": stake if stake > 0 else 1.0,
+                    "suggested_stake": stake if stake > 0 else 0.75,
                     "status": "ACTIVE"
                 })
             if edge_a_plus >= 2.5:
-                stake = half_kelly(sim["a_plus_15_p"], a_pl)
+                stake = quarter_kelly(sim["a_plus_15_p"], a_pl)
                 side_candidates.append({
                     "sport": "NHL",
                     "matchup": f"{a_abbr} @ {h_abbr}",
@@ -377,14 +371,14 @@ def generate_nhl_recommendations():
                     "fair_odds": prob_to_american(sim["a_plus_15_p"]),
                     "book_odds": a_pl,
                     "ev_percent": round(edge_a_plus, 1),
-                    "suggested_stake": stake if stake > 0 else 1.0,
+                    "suggested_stake": stake if stake > 0 else 0.75,
                     "status": "ACTIVE"
                 })
         else:
             edge_a_minus = (sim["a_minus_15_p"] - american_to_implied(a_pl)) * 100.0
             edge_h_plus = (sim["h_plus_15_p"] - american_to_implied(h_pl)) * 100.0
             if edge_a_minus >= 2.5:
-                stake = half_kelly(sim["a_minus_15_p"], a_pl)
+                stake = quarter_kelly(sim["a_minus_15_p"], a_pl)
                 side_candidates.append({
                     "sport": "NHL",
                     "matchup": f"{a_abbr} @ {h_abbr}",
@@ -393,11 +387,11 @@ def generate_nhl_recommendations():
                     "fair_odds": prob_to_american(sim["a_minus_15_p"]),
                     "book_odds": a_pl,
                     "ev_percent": round(edge_a_minus, 1),
-                    "suggested_stake": stake if stake > 0 else 1.0,
+                    "suggested_stake": stake if stake > 0 else 0.75,
                     "status": "ACTIVE"
                 })
             if edge_h_plus >= 2.5:
-                stake = half_kelly(sim["h_plus_15_p"], h_pl)
+                stake = quarter_kelly(sim["h_plus_15_p"], h_pl)
                 side_candidates.append({
                     "sport": "NHL",
                     "matchup": f"{a_abbr} @ {h_abbr}",
@@ -406,23 +400,19 @@ def generate_nhl_recommendations():
                     "fair_odds": prob_to_american(sim["h_plus_15_p"]),
                     "book_odds": h_pl,
                     "ev_percent": round(edge_h_plus, 1),
-                    "suggested_stake": stake if stake > 0 else 1.0,
+                    "suggested_stake": stake if stake > 0 else 0.75,
                     "status": "ACTIVE"
                 })
 
-        # STRICT DESK DEDUPLICATION: Take only the single best SIDE play per game by EV
         if side_candidates:
             best_side = max(side_candidates, key=lambda x: x["ev_percent"])
             recs.append(best_side)
 
-        # ----------------------------------------------------------------------
-        # Evaluate Total Candidate (Takes at most 1 Total per game)
-        # ----------------------------------------------------------------------
         eo = (sim["fair_o_p"] - american_to_implied(o_j)) * 100.0
         eu = (sim["fair_u_p"] - american_to_implied(u_j)) * 100.0
 
         if eo >= 2.5 and eo >= eu:
-            stake = half_kelly(sim["fair_o_p"], o_j)
+            stake = quarter_kelly(sim["fair_o_p"], o_j)
             recs.append({
                 "sport": "NHL",
                 "matchup": f"{a_abbr} @ {h_abbr}",
@@ -431,11 +421,11 @@ def generate_nhl_recommendations():
                 "fair_odds": prob_to_american(sim["fair_o_p"]),
                 "book_odds": o_j,
                 "ev_percent": round(eo, 1),
-                "suggested_stake": stake if stake > 0 else 1.0,
+                "suggested_stake": stake if stake > 0 else 0.75,
                 "status": "ACTIVE"
             })
         elif eu >= 2.5 and eu > eo:
-            stake = half_kelly(sim["fair_u_p"], u_j)
+            stake = quarter_kelly(sim["fair_u_p"], u_j)
             recs.append({
                 "sport": "NHL",
                 "matchup": f"{a_abbr} @ {h_abbr}",
@@ -444,7 +434,7 @@ def generate_nhl_recommendations():
                 "fair_odds": prob_to_american(sim["fair_u_p"]),
                 "book_odds": u_j,
                 "ev_percent": round(eu, 1),
-                "suggested_stake": stake if stake > 0 else 1.0,
+                "suggested_stake": stake if stake > 0 else 0.75,
                 "status": "ACTIVE"
             })
 
