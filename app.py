@@ -17,15 +17,22 @@ def get_config(key, default=None):
         pass
     return os.getenv(key, default)
 
-SUPABASE_URL = get_config("SUPABASE_URL", "https://btzzkdnijzzdqvjnomr.supabase.co").rstrip("/")
+SUPABASE_URL = get_config("SUPABASE_URL", "https://btzzkdjnijzzdqvjnomr.supabase.co").rstrip("/")
 SUPABASE_KEY = get_config("SUPABASE_KEY", "")
 
+# Send apikey without Bearer wrapper to support Supabase secret/publishable tokens
 HEADERS = {
     "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "return=representation"
+    "Authorization": f"Bearer {SUPABASE_KEY}" if SUPABASE_KEY.startswith("eyJ") else f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json"
 }
+
+if not SUPABASE_KEY.startswith("eyJ"):
+    # For sb_secret_... and sb_publishable_... keys
+    HEADERS = {
+        "apikey": SUPABASE_KEY,
+        "Content-Type": "application/json"
+    }
 
 st.title("Syndicate Production Terminal")
 
@@ -41,15 +48,22 @@ with tab_recs:
             st.rerun()
 
     try:
-        url = f"{SUPABASE_URL}/rest/v1/bet_recommendations?status=eq.ACTIVE&order=ev_percent.desc"
+        url = f"{SUPABASE_URL}/rest/v1/bet_recommendations?status=eq.ACTIVE"
         res = requests.get(url, headers=HEADERS, timeout=10)
         
         if res.status_code == 200 and res.json():
             df = pd.DataFrame(res.json())
-            sports = list(df["sport"].unique())
+            
+            if "ev_percent" in df.columns:
+                df["ev_percent"] = pd.to_numeric(df["ev_percent"], errors="coerce")
+                df = df.sort_values(by="ev_percent", ascending=False)
+            
+            sports = [s for s in df["sport"].dropna().unique()]
             selected_sports = st.pills("Filter by Sport", sports, selection_mode="multi", default=sports)
             filtered_df = df[df["sport"].isin(selected_sports)] if selected_sports else df
-            st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+            
+            display_cols = [c for c in ["sport", "matchup", "market", "pick", "fair_odds", "book_odds", "ev_percent", "suggested_stake"] if c in filtered_df.columns]
+            st.dataframe(filtered_df[display_cols], use_container_width=True, hide_index=True)
         else:
             st.info("No active recommendations currently logged for today's slate.")
     except Exception as exc:
