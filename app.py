@@ -26,10 +26,6 @@ st.markdown("""
         margin-right: 8px;
     }
     .badge-edge { color: #10b981; font-weight: 700; font-size: 13px; }
-    .status-won { color: #10b981; font-weight: 700; }
-    .status-lost { color: #ef4444; font-weight: 700; }
-    .status-push { color: #94a3b8; font-weight: 700; }
-    .status-open { color: #3b82f6; font-weight: 700; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -45,17 +41,18 @@ HEADERS = {
     "Prefer": "return=representation"
 }
 
-def send_telegram_alert(sport, matchup, market, pick, odds, stake, ev):
+def send_telegram_alert(sport, matchup, market, pick, odds, stake, ev="MANUAL"):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
+    ev_display = f"+{ev}%" if ev != "MANUAL" else "MANUAL / OFF-MODEL"
     text = (
         f"🚨 *HOVA SYNDICATE PLAY LOCKED*\n\n"
         f"🏆 *Sport:* {sport}\n"
         f"⚔️ *Matchup:* {matchup}\n"
         f"🎯 *Market:* {market}\n"
         f"⚡ *Pick:* {pick}\n"
-        f"📈 *Book Odds:* {odds:+d} (American)\n"
+        f"📈 *Book Odds:* {odds:+d}\n"
         f"💰 *Stake:* {stake}u\n"
-        f"💎 *EV:* +{ev}%\n\n"
+        f"💎 *EV:* {ev_display}\n\n"
         f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     )
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -88,9 +85,10 @@ def record_wager(row_data, booked_odds, booked_units, bookmaker):
     try:
         r = requests.post(f"{SUPABASE_URL}/rest/v1/ledger_entries", headers=HEADERS, json=payload, timeout=8)
         if r.status_code in [200, 201]:
+            ev_val = row_data.get("ev_percent", "MANUAL")
             send_telegram_alert(
                 row_data["sport"], row_data["matchup"], row_data["market"],
-                row_data["pick"], booked_odds, booked_units, row_data["ev_percent"]
+                row_data["pick"], booked_odds, booked_units, ev_val
             )
             return True, "Success"
         else:
@@ -98,14 +96,14 @@ def record_wager(row_data, booked_odds, booked_units, bookmaker):
     except Exception as e:
         return False, str(e)
 
-# Main Title & Subtitle
+# Layout Setup
 st.markdown("<h2 style='margin-bottom:0;'>Syndicate Production Terminal</h2>", unsafe_allow_html=True)
 st.caption("Quantitative Multi-Sport Desk • Quarter-Kelly Sizing • Autonomous Cloud Pipeline")
 
 tabs = st.tabs(["Active Model Recommendations", "Execution Ledger", "CLV & Settlement Audit"])
 
 # ==============================================================================
-# TAB 1: RECOMMENDATIONS + 1-CLICK BET STAGING
+# TAB 1: RECOMMENDATIONS + 1-CLICK BET STAGER
 # ==============================================================================
 with tabs[0]:
     col_t1, col_t2 = st.columns([4, 1])
@@ -186,19 +184,47 @@ with tabs[0]:
         st.info("No active edge recommendations currently in database. Hit Sync Live Slate above.")
 
 # ==============================================================================
-# TAB 2: EXECUTION LEDGER
+# TAB 2: EXECUTION LEDGER + MANUAL ENTRY DRAWER
 # ==============================================================================
 with tabs[1]:
-    st.subheader("Locked Positions Ledger")
+    col_l1, col_l2 = st.columns([4, 1])
+    with col_l1:
+        st.subheader("Locked Positions Ledger")
+    with col_l2:
+        with st.popover("➕ Log Manual Bet", use_container_width=True):
+            st.markdown("##### Manual / Off-Model Entry")
+            m_sport = st.selectbox("Sport", ["NFL", "CFB", "NHL", "MLB", "WNBA", "EPL"])
+            m_matchup = st.text_input("Matchup (e.g. AWAY @ HOME)", placeholder="KC @ BAL")
+            m_market = st.selectbox("Market", ["Moneyline", "Spread", "Total", "Puck Line", "Run Line", "Player Prop"])
+            m_pick = st.text_input("Pick", placeholder="KC +3.0")
+            m_odds = st.number_input("Odds (American)", value=-110, step=1)
+            m_stake = st.number_input("Stake Units", value=1.00, min_value=0.25, step=0.25)
+            m_book = st.selectbox("Bookmaker", ["DraftKings", "FanDuel", "BetMGM", "Caesars", "Circa", "Pinnacle"])
+            
+            if st.button("Submit Manual Wager", type="primary", use_container_width=True):
+                if m_matchup and m_pick:
+                    payload = {
+                        "sport": m_sport,
+                        "matchup": m_matchup.strip().upper(),
+                        "market": m_market,
+                        "pick": m_pick.strip(),
+                        "ev_percent": "MANUAL"
+                    }
+                    success, msg = record_wager(payload, m_odds, m_stake, m_book)
+                    if success:
+                        st.success(f"Logged {m_pick} ({m_stake}u) successfully!")
+                        st.rerun()
+                    else:
+                        st.error(f"Commit Failed: {msg}")
+                else:
+                    st.warning("Please fill in Matchup and Pick fields.")
+
     df_ledger = fetch_table("ledger_entries")
     if not df_ledger.empty:
         df_ledger = df_ledger.sort_values(by="created_at", ascending=False)
         display_cols = ["created_at", "sport", "matchup", "market", "pick", "odds", "stake_units", "bookmaker", "status"]
-        if "net_units" in df_ledger.columns:
-            display_cols.append("net_units")
-        if "result_score" in df_ledger.columns:
-            display_cols.append("result_score")
-        
+        if "net_units" in df_ledger.columns: display_cols.append("net_units")
+        if "result_score" in df_ledger.columns: display_cols.append("result_score")
         st.dataframe(df_ledger[display_cols], use_container_width=True, hide_index=True)
     else:
         st.info("No wagers locked in the ledger yet.")
@@ -219,7 +245,6 @@ with tabs[2]:
 
     df_ledger = fetch_table("ledger_entries")
     if not df_ledger.empty:
-        # Calculate syndicate performance metrics
         settled_mask = df_ledger["status"].isin(["WON", "LOST", "PUSH"])
         df_settled = df_ledger[settled_mask]
         
@@ -237,7 +262,6 @@ with tabs[2]:
         m2.metric("Graded Record", f"{wins}W - {losses}L - {pushes}P", f"{open_bets} Pending")
         m3.metric("Total Volume Wagered", f"{df_ledger['stake_units'].astype(float).sum():.2f}u")
         
-        # Calculate Average CLV Beat
         if "clv_percent" in df_ledger.columns and not df_ledger["clv_percent"].dropna().empty:
             avg_clv = df_ledger["clv_percent"].astype(float).mean()
             m4.metric("Consensus CLV Edge", f"{avg_clv:+.2f}%")
@@ -245,13 +269,11 @@ with tabs[2]:
             m4.metric("Consensus CLV Edge", "--")
 
         st.divider()
-
         st.markdown("#### Audited Position History")
         audit_cols = ["sport", "matchup", "pick", "odds", "stake_units", "status"]
         if "net_units" in df_ledger.columns: audit_cols.append("net_units")
         if "result_score" in df_ledger.columns: audit_cols.append("result_score")
         if "clv_percent" in df_ledger.columns: audit_cols.append("clv_percent")
-
         st.dataframe(df_ledger[audit_cols], use_container_width=True, hide_index=True)
     else:
         st.info("Lock wagers in the Recommendations tab to start tracking settlement and closing line value.")
