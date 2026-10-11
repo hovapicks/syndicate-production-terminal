@@ -6,6 +6,7 @@ from models.nfl_pipeline import generate_nfl_recommendations
 from models.nhl_pipeline import generate_nhl_recommendations
 from models.epl_pipeline import generate_epl_recommendations
 from models.cfb_pipeline import generate_cfb_recommendations
+from models.wnba_pipeline import generate_wnba_recommendations
 
 load_dotenv()
 
@@ -20,10 +21,10 @@ HEADERS = {
 }
 
 def run_pipeline():
-    print("[*] Initiating Autonomous Syndicate Pipeline Worker (4-Sport Engine)...")
+    print("[*] Initiating Autonomous Syndicate Pipeline Worker (5-Sport Engine)...")
     all_recs = []
 
-    # 1. NFL Engine (Bayesian EPA, Weather & Key Push Equity)
+    # 1. NFL Engine
     try:
         print("[*] Running NFL quantitative engine...")
         nfl_recs = generate_nfl_recommendations()
@@ -32,7 +33,7 @@ def run_pipeline():
     except Exception as e:
         print(f"[!] NFL pipeline error: {e}")
 
-    # 2. NHL Engine (Dixon-Coles + ENG Markov + Crease Scraper)
+    # 2. NHL Engine
     try:
         print("[*] Running NHL Dixon-Coles engine...")
         nhl_recs = generate_nhl_recommendations()
@@ -41,7 +42,7 @@ def run_pipeline():
     except Exception as e:
         print(f"[!] NHL pipeline error: {e}")
 
-    # 3. EPL Engine (Bivariate Dixon-Coles & Att/Def Ratings)
+    # 3. EPL Engine
     try:
         print("[*] Running EPL quantitative engine...")
         epl_recs = generate_epl_recommendations()
@@ -50,7 +51,7 @@ def run_pipeline():
     except Exception as e:
         print(f"[!] EPL pipeline error: {e}")
 
-    # 4. CFB Engine (Talent Composite Priors, Elevation/Weather & Academy Multipliers)
+    # 4. CFB Engine
     try:
         print("[*] Running NCAA CFB quantitative engine...")
         cfb_recs = generate_cfb_recommendations()
@@ -59,7 +60,16 @@ def run_pipeline():
     except Exception as e:
         print(f"[!] CFB pipeline error: {e}")
 
-    # 5. Atomic Push to Supabase PostgREST
+    # 5. WNBA Engine
+    try:
+        print("[*] Running WNBA recency-weighted engine...")
+        wnba_recs = generate_wnba_recommendations()
+        print(f"[✓] WNBA generated {len(wnba_recs)} verified plays.")
+        all_recs.extend(wnba_recs)
+    except Exception as e:
+        print(f"[!] WNBA pipeline error: {e}")
+
+    # 6. Atomic Push to Supabase PostgREST
     if all_recs:
         df = pd.DataFrame(all_recs).sort_values(by="ev_percent", ascending=False)
         df = df.drop_duplicates(subset=["sport", "matchup", "market", "pick"])
@@ -74,7 +84,7 @@ def run_pipeline():
             headers=HEADERS,
             json=clean_recs
         )
-        print(f"[✓] Synced {len(clean_recs)} total multi-sport plays across NFL, NHL, EPL, and CFB to Supabase (Status: {post_res.status_code}).")
+        print(f"[✓] Synced {len(clean_recs)} total multi-sport plays across NFL, NHL, EPL, CFB, and WNBA to Supabase (Status: {post_res.status_code}).")
     else:
         print("[!] No active edges cleared the strict syndicate hurdles across slates.")
 
