@@ -4,12 +4,13 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from settlement_engine import run_settlement, calculate_clv
 
 load_dotenv()
 
 st.set_page_config(page_title="Syndicate Production Terminal", layout="wide", initial_sidebar_state="collapsed")
 
-# Custom Dark Terminal CSS
+# Custom Dark Terminal Styling
 st.markdown("""
 <style>
     .stApp { background-color: #0b111e; color: #d1d5db; }
@@ -24,11 +25,11 @@ st.markdown("""
         color: #93c5fd;
         margin-right: 8px;
     }
-    .badge-edge {
-        color: #10b981;
-        font-weight: 700;
-        font-size: 13px;
-    }
+    .badge-edge { color: #10b981; font-weight: 700; font-size: 13px; }
+    .status-won { color: #10b981; font-weight: 700; }
+    .status-lost { color: #ef4444; font-weight: 700; }
+    .status-push { color: #94a3b8; font-weight: 700; }
+    .status-open { color: #3b82f6; font-weight: 700; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -45,8 +46,7 @@ HEADERS = {
 }
 
 def send_telegram_alert(sport, matchup, market, pick, odds, stake, ev):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
     text = (
         f"🚨 *HOVA SYNDICATE PLAY LOCKED*\n\n"
         f"🏆 *Sport:* {sport}\n"
@@ -98,14 +98,14 @@ def record_wager(row_data, booked_odds, booked_units, bookmaker):
     except Exception as e:
         return False, str(e)
 
-# Header & Controls
+# Main Title & Subtitle
 st.markdown("<h2 style='margin-bottom:0;'>Syndicate Production Terminal</h2>", unsafe_allow_html=True)
 st.caption("Quantitative Multi-Sport Desk • Quarter-Kelly Sizing • Autonomous Cloud Pipeline")
 
-tabs = st.tabs(["Active Model Recommendations", "Execution Ledger", "CLV Audit"])
+tabs = st.tabs(["Active Model Recommendations", "Execution Ledger", "CLV & Settlement Audit"])
 
 # ==============================================================================
-# TAB 1: RECOMMENDATIONS + 1-CLICK BET LOGGER
+# TAB 1: RECOMMENDATIONS + 1-CLICK BET STAGING
 # ==============================================================================
 with tabs[0]:
     col_t1, col_t2 = st.columns([4, 1])
@@ -193,24 +193,65 @@ with tabs[1]:
     df_ledger = fetch_table("ledger_entries")
     if not df_ledger.empty:
         df_ledger = df_ledger.sort_values(by="created_at", ascending=False)
-        st.dataframe(
-            df_ledger[["created_at", "sport", "matchup", "market", "pick", "odds", "stake_units", "bookmaker", "status"]],
-            use_container_width=True,
-            hide_index=True
-        )
+        display_cols = ["created_at", "sport", "matchup", "market", "pick", "odds", "stake_units", "bookmaker", "status"]
+        if "net_units" in df_ledger.columns:
+            display_cols.append("net_units")
+        if "result_score" in df_ledger.columns:
+            display_cols.append("result_score")
+        
+        st.dataframe(df_ledger[display_cols], use_container_width=True, hide_index=True)
     else:
         st.info("No wagers locked in the ledger yet.")
 
 # ==============================================================================
-# TAB 3: CLV AUDIT
+# TAB 3: CLV & SETTLEMENT AUDIT
 # ==============================================================================
 with tabs[2]:
-    st.subheader("Closing Line Value (CLV) Performance Audit")
+    col_s1, col_s2 = st.columns([4, 1])
+    with col_s1:
+        st.subheader("Closing Line Value & Performance Audit")
+    with col_s2:
+        if st.button("⚡ Audit & Settle", use_container_width=True, type="primary"):
+            with st.spinner("Checking ESPN scores & settling tickets..."):
+                run_settlement()
+                st.success("Reconciliation complete!")
+                st.rerun()
+
     df_ledger = fetch_table("ledger_entries")
     if not df_ledger.empty:
-        col_m1, col_m2, col_m3 = st.columns(3)
-        col_m1.metric("Total Wagers Locked", len(df_ledger))
-        col_m2.metric("Total Bankroll Allocated", f"{df_ledger['stake_units'].sum():.2f}u")
-        col_m3.metric("Open Action Count", len(df_ledger[df_ledger['status'] == 'OPEN']))
+        # Calculate syndicate performance metrics
+        settled_mask = df_ledger["status"].isin(["WON", "LOST", "PUSH"])
+        df_settled = df_ledger[settled_mask]
+        
+        net_profit = df_settled["net_units"].astype(float).sum() if "net_units" in df_settled.columns else 0.0
+        total_risk = df_settled["stake_units"].astype(float).sum()
+        roi_pct = (net_profit / total_risk * 100.0) if total_risk > 0 else 0.0
+
+        wins = len(df_ledger[df_ledger["status"] == "WON"])
+        losses = len(df_ledger[df_ledger["status"] == "LOST"])
+        pushes = len(df_ledger[df_ledger["status"] == "PUSH"])
+        open_bets = len(df_ledger[df_ledger["status"] == "OPEN"])
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Cumulative Net P&L", f"{net_profit:+.2f}u", delta=f"{roi_pct:+.1f}% ROI")
+        m2.metric("Graded Record", f"{wins}W - {losses}L - {pushes}P", f"{open_bets} Pending")
+        m3.metric("Total Volume Wagered", f"{df_ledger['stake_units'].astype(float).sum():.2f}u")
+        
+        # Calculate Average CLV Beat
+        if "clv_percent" in df_ledger.columns and not df_ledger["clv_percent"].dropna().empty:
+            avg_clv = df_ledger["clv_percent"].astype(float).mean()
+            m4.metric("Consensus CLV Edge", f"{avg_clv:+.2f}%")
+        else:
+            m4.metric("Consensus CLV Edge", "--")
+
+        st.divider()
+
+        st.markdown("#### Audited Position History")
+        audit_cols = ["sport", "matchup", "pick", "odds", "stake_units", "status"]
+        if "net_units" in df_ledger.columns: audit_cols.append("net_units")
+        if "result_score" in df_ledger.columns: audit_cols.append("result_score")
+        if "clv_percent" in df_ledger.columns: audit_cols.append("clv_percent")
+
+        st.dataframe(df_ledger[audit_cols], use_container_width=True, hide_index=True)
     else:
-        st.info("Log wagers to begin tracking closing line value performance.")
+        st.info("Lock wagers in the Recommendations tab to start tracking settlement and closing line value.")

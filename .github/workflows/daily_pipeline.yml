@@ -2,8 +2,7 @@
 
 on:
   schedule:
-    # 08:00 UTC = 4:00 AM EDT
-    - cron: '0 8 * * *'
+    - cron: '0 8 * * *'  # 4:00 AM EDT (08:00 UTC)
   workflow_dispatch:
 
 jobs:
@@ -17,17 +16,28 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
           cache: 'pip'
 
       - name: Install Dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Pipeline Worker
+      - name: Execute Score Settlement Engine
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python settlement_engine.py
+
+      - name: Execute 5-Sport Production Engine
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          ODDS_API_KEY_1: ${{ secrets.ODDS_API_KEY_1 }}
+          ODDS_API_KEY_2: ${{ secrets.ODDS_API_KEY_2 }}
+          ODDS_API_KEY_3: ${{ secrets.ODDS_API_KEY_3 }}
+          ODDS_API_KEY_4: ${{ secrets.ODDS_API_KEY_4 }}
         run: |
           python pipeline_worker.py
