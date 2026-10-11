@@ -313,13 +313,18 @@ def generate_nhl_recommendations():
         sim = simulate_dixon_coles(h_abbr, a_abbr, h_b2b, a_b2b, tot, crease_map)
         fair_mkt_a, fair_mkt_h = devig_power_ratio(a_ml, h_ml)
 
-        # 1. Moneyline Evaluation
+        # ----------------------------------------------------------------------
+        # Evaluate Side Candidates (Moneyline vs Puck Line)
+        # ----------------------------------------------------------------------
+        side_candidates = []
+
+        # ML Options
         eh_ml = (sim["h_ml_p"] - fair_mkt_h) * 100.0
         ea_ml = (sim["a_ml_p"] - fair_mkt_a) * 100.0
 
-        if eh_ml >= 2.5 and eh_ml >= ea_ml:
+        if eh_ml >= 2.5:
             stake = half_kelly(sim["h_ml_p"], h_ml)
-            recs.append({
+            side_candidates.append({
                 "sport": "NHL",
                 "matchup": f"{a_abbr} @ {h_abbr}",
                 "market": "Moneyline",
@@ -330,9 +335,9 @@ def generate_nhl_recommendations():
                 "suggested_stake": stake if stake > 0 else 1.0,
                 "status": "ACTIVE"
             })
-        elif ea_ml >= 2.5 and ea_ml > eh_ml:
+        if ea_ml >= 2.5:
             stake = half_kelly(sim["a_ml_p"], a_ml)
-            recs.append({
+            side_candidates.append({
                 "sport": "NHL",
                 "matchup": f"{a_abbr} @ {h_abbr}",
                 "market": "Moneyline",
@@ -344,14 +349,14 @@ def generate_nhl_recommendations():
                 "status": "ACTIVE"
             })
 
-        # 2. Puck Line Evaluation
+        # Puck Line Options
         is_home_fav = h_ml <= a_ml
         if is_home_fav:
             edge_h_minus = (sim["h_minus_15_p"] - american_to_implied(h_pl)) * 100.0
             edge_a_plus = (sim["a_plus_15_p"] - american_to_implied(a_pl)) * 100.0
-            if edge_h_minus >= 2.5 and edge_h_minus >= edge_a_plus:
+            if edge_h_minus >= 2.5:
                 stake = half_kelly(sim["h_minus_15_p"], h_pl)
-                recs.append({
+                side_candidates.append({
                     "sport": "NHL",
                     "matchup": f"{a_abbr} @ {h_abbr}",
                     "market": "Puck Line",
@@ -362,9 +367,9 @@ def generate_nhl_recommendations():
                     "suggested_stake": stake if stake > 0 else 1.0,
                     "status": "ACTIVE"
                 })
-            elif edge_a_plus >= 2.5 and edge_a_plus > edge_h_minus:
+            if edge_a_plus >= 2.5:
                 stake = half_kelly(sim["a_plus_15_p"], a_pl)
-                recs.append({
+                side_candidates.append({
                     "sport": "NHL",
                     "matchup": f"{a_abbr} @ {h_abbr}",
                     "market": "Puck Line",
@@ -378,9 +383,9 @@ def generate_nhl_recommendations():
         else:
             edge_a_minus = (sim["a_minus_15_p"] - american_to_implied(a_pl)) * 100.0
             edge_h_plus = (sim["h_plus_15_p"] - american_to_implied(h_pl)) * 100.0
-            if edge_a_minus >= 2.5 and edge_a_minus >= edge_h_plus:
+            if edge_a_minus >= 2.5:
                 stake = half_kelly(sim["a_minus_15_p"], a_pl)
-                recs.append({
+                side_candidates.append({
                     "sport": "NHL",
                     "matchup": f"{a_abbr} @ {h_abbr}",
                     "market": "Puck Line",
@@ -391,9 +396,9 @@ def generate_nhl_recommendations():
                     "suggested_stake": stake if stake > 0 else 1.0,
                     "status": "ACTIVE"
                 })
-            elif edge_h_plus >= 2.5 and edge_h_plus > edge_a_minus:
+            if edge_h_plus >= 2.5:
                 stake = half_kelly(sim["h_plus_15_p"], h_pl)
-                recs.append({
+                side_candidates.append({
                     "sport": "NHL",
                     "matchup": f"{a_abbr} @ {h_abbr}",
                     "market": "Puck Line",
@@ -405,10 +410,18 @@ def generate_nhl_recommendations():
                     "status": "ACTIVE"
                 })
 
-        # 3. Totals Evaluation
+        # STRICT DESK DEDUPLICATION: Take only the single best SIDE play per game by EV
+        if side_candidates:
+            best_side = max(side_candidates, key=lambda x: x["ev_percent"])
+            recs.append(best_side)
+
+        # ----------------------------------------------------------------------
+        # Evaluate Total Candidate (Takes at most 1 Total per game)
+        # ----------------------------------------------------------------------
         eo = (sim["fair_o_p"] - american_to_implied(o_j)) * 100.0
         eu = (sim["fair_u_p"] - american_to_implied(u_j)) * 100.0
-        if eo >= 2.5:
+
+        if eo >= 2.5 and eo >= eu:
             stake = half_kelly(sim["fair_o_p"], o_j)
             recs.append({
                 "sport": "NHL",
@@ -421,7 +434,7 @@ def generate_nhl_recommendations():
                 "suggested_stake": stake if stake > 0 else 1.0,
                 "status": "ACTIVE"
             })
-        elif eu >= 2.5:
+        elif eu >= 2.5 and eu > eo:
             stake = half_kelly(sim["fair_u_p"], u_j)
             recs.append({
                 "sport": "NHL",
