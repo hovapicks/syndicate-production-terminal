@@ -5,6 +5,7 @@ import streamlit as st
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from settlement_engine import run_settlement, calculate_clv
+from pipeline_worker import run_pipeline
 
 load_dotenv()
 
@@ -47,15 +48,7 @@ HEADERS = {
 }
 
 def american_to_decimal(amer):
-    if amer > 0:
-        return (amer / 100.0) + 1.0
-    else:
-        return (100.0 / abs(amer)) + 1.0
-
-def calculate_dynamic_ev(fair_prob, entered_odds):
-    dec = american_to_decimal(entered_odds)
-    ev = (fair_prob * dec) - 1.0
-    return round(ev * 100.0, 2)
+    return (amer / 100.0) + 1.0 if amer > 0 else (100.0 / abs(amer)) + 1.0
 
 def send_telegram_alert(sport, matchup, market, pick, odds, stake, ev="MANUAL"):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
@@ -117,21 +110,26 @@ st.caption("Quantitative Multi-Sport Desk • Quarter-Kelly Sizing • Autonomou
 tabs = st.tabs(["Active Model Recommendations", "Execution Ledger", "CLV & Settlement Audit"])
 
 # ==============================================================================
-# TAB 1: RECOMMENDATIONS + DYNAMIC EV STAGER
+# TAB 1: RECOMMENDATIONS + OPENER TOGGLE
 # ==============================================================================
 with tabs[0]:
-    col_t1, col_t2 = st.columns([4, 1])
+    col_t1, col_t2 = st.columns([4, 1.2])
     with col_t1:
         st.subheader("Daily Model Edge Recommendations")
     with col_t2:
-        if st.button("🔄 Sync Live Slate", use_container_width=True):
-            st.rerun()
+        if st.button("🔄 Sync Live Slate", use_container_width=True, type="primary"):
+            with st.spinner("Fetching live market odds & re-indexing slate..."):
+                run_pipeline()
+                st.success("Slate refreshed!")
+                st.rerun()
 
     df_recs = fetch_table("bet_recommendations")
 
     if not df_recs.empty:
-        sports_present = sorted(df_recs["sport"].unique().tolist())
-        selected_sport = st.pills("Filter by Sport", ["ALL"] + sports_present, default="ALL")
+        col_f1, col_f2 = st.columns([3, 2])
+        with col_f1:
+            sports_present = sorted(df_recs["sport"].unique().tolist())
+            selected_sport = st.pills("Filter by Sport", ["ALL"] + sports_present, default="ALL")
 
         view_df = df_recs if selected_sport == "ALL" else df_recs[df_recs["sport"] == selected_sport]
 
@@ -156,19 +154,9 @@ with tabs[0]:
                     b_stake = st.number_input("Stake Units", value=float(stg["suggested_stake"]), min_value=0.25, step=0.25, key="stage_stake")
                 with col_b3:
                     book_name = st.selectbox("Bookmaker", BOOKMAKERS, key="stage_book")
-
-                # Dynamic EV Calculation if model probability is available
-                fair_p = float(stg.get("fair_prob", 0.0))
-                if fair_p > 0:
-                    live_ev = calculate_dynamic_ev(fair_p, b_odds)
-                    ev_color = "#10b981" if live_ev >= 2.0 else "#f59e0b" if live_ev > 0 else "#ef4444"
-                    st.markdown(f"<span style='color:{ev_color}; font-weight:600; font-size:13px;'>Live Recalculated EV: {live_ev:+g}%</span>", unsafe_allow_html=True)
-                else:
-                    live_ev = stg.get("ev_percent", "MANUAL")
-
                 with col_b4:
                     if st.button("✅ Commit to Ledger", use_container_width=True, type="primary"):
-                        success, msg = record_wager(stg, b_odds, b_stake, book_name, live_ev)
+                        success, msg = record_wager(stg, b_odds, b_stake, book_name, stg.get("ev_percent", "MANUAL"))
                         if success:
                             st.success(f"Locked {stg['pick']} ({b_stake}u) to Ledger & dispatched alert!")
                             st.session_state.staged_pick = None
@@ -201,11 +189,9 @@ with tabs[0]:
             st.divider()
 
     else:
-        st.info("No active edge recommendations currently in database. Hit Sync Live Slate above.")
+        st.info("No active edge recommendations in database. Hit Sync Live Slate above.")
 
-# ==============================================================================
-# TAB 2: EXECUTION LEDGER + MANUAL ENTRY DRAWER
-# ==============================================================================
+# TAB 2: EXECUTION LEDGER
 with tabs[1]:
     col_l1, col_l2 = st.columns([4, 1])
     with col_l1:
@@ -214,7 +200,7 @@ with tabs[1]:
         with st.popover("➕ Log Manual Bet", use_container_width=True):
             st.markdown("##### Manual / Off-Model Entry")
             m_sport = st.selectbox("Sport", ["NFL", "CFB", "NHL", "MLB", "WNBA", "EPL"])
-            m_matchup = st.text_input("Matchup (e.g. AWAY @ HOME)", placeholder="KC @ BAL")
+            m_matchup = st.text_input("Matchup", placeholder="KC @ BAL")
             m_market = st.selectbox("Market", ["Moneyline", "Spread", "Total", "Puck Line", "Run Line", "Player Prop"])
             m_pick = st.text_input("Pick", placeholder="KC +3.0")
             m_odds = st.number_input("Odds (American)", value=-110, step=1)
@@ -223,20 +209,13 @@ with tabs[1]:
             
             if st.button("Submit Manual Wager", type="primary", use_container_width=True):
                 if m_matchup and m_pick:
-                    payload = {
-                        "sport": m_sport,
-                        "matchup": m_matchup.strip().upper(),
-                        "market": m_market,
-                        "pick": m_pick.strip()
-                    }
+                    payload = {"sport": m_sport, "matchup": m_matchup.strip().upper(), "market": m_market, "pick": m_pick.strip()}
                     success, msg = record_wager(payload, m_odds, m_stake, m_book, "MANUAL")
                     if success:
                         st.success(f"Logged {m_pick} ({m_stake}u) successfully!")
                         st.rerun()
                     else:
                         st.error(f"Commit Failed: {msg}")
-                else:
-                    st.warning("Please fill in Matchup and Pick fields.")
 
     df_ledger = fetch_table("ledger_entries")
     if not df_ledger.empty:
@@ -248,9 +227,7 @@ with tabs[1]:
     else:
         st.info("No wagers locked in the ledger yet.")
 
-# ==============================================================================
 # TAB 3: CLV & SETTLEMENT AUDIT
-# ==============================================================================
 with tabs[2]:
     col_s1, col_s2 = st.columns([4, 1])
     with col_s1:
@@ -266,7 +243,6 @@ with tabs[2]:
     if not df_ledger.empty:
         settled_mask = df_ledger["status"].isin(["WON", "LOST", "PUSH"])
         df_settled = df_ledger[settled_mask]
-        
         net_profit = df_settled["net_units"].astype(float).sum() if "net_units" in df_settled.columns else 0.0
         total_risk = df_settled["stake_units"].astype(float).sum()
         roi_pct = (net_profit / total_risk * 100.0) if total_risk > 0 else 0.0
@@ -295,4 +271,4 @@ with tabs[2]:
         if "clv_percent" in df_ledger.columns: audit_cols.append("clv_percent")
         st.dataframe(df_ledger[audit_cols], use_container_width=True, hide_index=True)
     else:
-        st.info("Lock wagers in the Recommendations tab to start tracking settlement and closing line value.")
+        st.info("No wagers locked in the ledger yet.")
