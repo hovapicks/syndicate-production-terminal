@@ -36,12 +36,6 @@ def decimal_to_american(dec):
     if dec <= 1.0: return -110
     return int(round((dec - 1.0) * 100)) if dec >= 2.0 else int(round(-100 / (dec - 1.0)))
 
-def american_to_prob(amer):
-    if amer > 0:
-        return 100.0 / (amer + 100.0)
-    else:
-        return abs(amer) / (abs(amer) + 100.0)
-
 def fetch_market_odds(sport_key):
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
     params = {"regions": "us", "markets": "h2h,spreads,totals", "oddsFormat": "decimal"}
@@ -90,7 +84,6 @@ def extract_all_recommendations():
 
             matchup = f"{a_team} @ {h_team}"
 
-            # Aggregate best available prices across books per outcome
             market_buckets = {"h2h": {}, "spreads": {}, "totals": {}}
 
             for bm in ev.get("bookmakers", []):
@@ -104,7 +97,6 @@ def extract_all_recommendations():
                     p2_dec = outcomes[1].get("price", 0)
                     if p1_dec <= 1.0 or p2_dec <= 1.0: continue
 
-                    # Compute de-vigged fair probabilities for this bookmaker pair
                     vig = (1.0 / p1_dec) + (1.0 / p2_dec)
                     p1_fair = (1.0 / p1_dec) / vig
                     p2_fair = (1.0 / p2_dec) / vig
@@ -120,7 +112,10 @@ def extract_all_recommendations():
                     market_buckets[m_key][k1].append({"price": p1_dec, "fair": p1_fair})
                     market_buckets[m_key][k2].append({"price": p2_dec, "fair": p2_fair})
 
-            # Evaluate each market type and pick ONLY the single strongest side
+            # Process candidate picks
+            game_side_candidates = []
+            game_total_candidates = []
+
             for m_key, outcome_dict in market_buckets.items():
                 if not outcome_dict: continue
 
@@ -131,14 +126,12 @@ def extract_all_recommendations():
                 else:
                     mkt_name = "Total"
 
-                candidates = []
                 for (name, point), quotes in outcome_dict.items():
                     if not quotes: continue
                     best_quote = max(quotes, key=lambda q: q["price"])
                     avg_fair = np.mean([q["fair"] for q in quotes])
                     
                     price = best_quote["price"]
-                    # Apply calibrated model edge
                     fair_p = min(0.92, avg_fair * 1.035)
                     ev_pct = round(((fair_p * price) - 1.0) * 100.0, 1)
 
@@ -149,21 +142,33 @@ def extract_all_recommendations():
                         raw_k = (fair_p * b - (1.0 - fair_p)) / b
                         q_kelly = round(max(0.25, min(2.0, raw_k * 25.0)), 2)
 
-                        candidates.append({
+                        item = {
                             "sport": sport_label,
                             "matchup": matchup,
                             "market": mkt_name,
                             "pick": pick_str,
+                            "team_backed": name,
                             "book_odds": amer_odds,
                             "ev_percent": ev_pct,
                             "suggested_stake": q_kelly,
                             "is_lookahead": is_early_lookahead
-                        })
+                        }
 
-                # Take ONLY the best single side for this game and market to prevent opposing collisions
-                if candidates:
-                    candidates.sort(key=lambda x: x["ev_percent"], reverse=True)
-                    recommendations.append(candidates[0])
+                        if mkt_name == "Total":
+                            game_total_candidates.append(item)
+                        else:
+                            game_side_candidates.append(item)
+
+            # Strictly enforce one directional side per game (Moneyline OR Spread)
+            if game_side_candidates:
+                game_side_candidates.sort(key=lambda x: x["ev_percent"], reverse=True)
+                # Keep only the single highest-EV side play for this matchup
+                recommendations.append(game_side_candidates[0])
+
+            # Allow at most one total for the game
+            if game_total_candidates:
+                game_total_candidates.sort(key=lambda x: x["ev_percent"], reverse=True)
+                recommendations.append(game_total_candidates[0])
 
     df = pd.DataFrame(recommendations)
     return df
@@ -171,7 +176,6 @@ def extract_all_recommendations():
 def balance_multi_sport_board(df, max_picks=8):
     if df.empty: return df
 
-    # Enforce multi-sport representation across active board
     nhl_df = df[df["sport"] == "NHL"].sort_values(by="ev_percent", ascending=False)
     mlb_df = df[df["sport"] == "MLB"].sort_values(by="ev_percent", ascending=False)
     nfl_df = df[df["sport"] == "NFL"].sort_values(by="ev_percent", ascending=False)
@@ -290,7 +294,7 @@ def apply_portfolio_risk_governor(recs_df, max_slate_exposure=6.0):
     return recs_df, was_capped
 
 def run_pipeline():
-    print("[*] Ingesting multi-sport slate (NHL, MLB, NFL)...")
+    print("[*] Ingesting multi-sport slate with single-side game resolution...")
     all_recs = extract_all_recommendations()
 
     if all_recs.empty:
@@ -301,14 +305,13 @@ def run_pipeline():
     today_df = all_recs[today_mask].copy()
     lookahead_df = all_recs[~today_mask].copy()
 
-    # Balance multi-sport representation
     balanced_today = balance_multi_sport_board(today_df, max_picks=8)
     balanced_lookahead = balance_multi_sport_board(lookahead_df, max_picks=6)
 
     governed_today, was_capped = apply_portfolio_risk_governor(balanced_today, MAX_DAILY_EXPOSURE_UNITS)
     total_stake = governed_today["suggested_stake"].sum() if not governed_today.empty else 0.0
 
-    print("[*] Writing clean multi-sport slate to Supabase...")
+    print("[*] Writing directional board to Supabase...")
     requests.delete(f"{SUPABASE_URL}/rest/v1/bet_recommendations?id=neq.00000000-0000-0000-0000-000000000000", headers=HEADERS, timeout=8)
 
     combined_df = pd.concat([governed_today, balanced_lookahead], ignore_index=True)
@@ -318,7 +321,7 @@ def run_pipeline():
 
     res = requests.post(f"{SUPABASE_URL}/rest/v1/bet_recommendations", headers=HEADERS, json=records, timeout=8)
     if res.status_code in [200, 201]:
-        print(f"[✓] Committed {len(records)} clean plays (NHL, MLB, NFL) to Supabase!")
+        print(f"[✓] Committed {len(records)} clean directional plays to Supabase!")
         send_morning_slate_email(governed_today, balanced_lookahead, total_stake, was_capped)
     else:
         print(f"[-] Supabase write error: {res.status_code} - {res.text}")
