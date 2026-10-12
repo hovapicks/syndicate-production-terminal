@@ -35,12 +35,6 @@ def decimal_to_american(dec):
     if dec <= 1.0: return -110
     return int(round((dec - 1.0) * 100)) if dec >= 2.0 else int(round(-100 / (dec - 1.0)))
 
-def american_to_prob(amer):
-    if amer > 0:
-        return 100.0 / (amer + 100.0)
-    else:
-        return abs(amer) / (abs(amer) + 100.0)
-
 def fetch_market_odds(sport_key):
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
     params = {"regions": "us", "markets": "h2h,spreads,totals", "oddsFormat": "decimal"}
@@ -51,10 +45,10 @@ def fetch_market_odds(sport_key):
         try:
             r = requests.get(url, params=params, timeout=10)
             if r.status_code == 200:
-                print(f"[✓] Retrieved live {sport_key} multi-markets.")
+                print(f"[✓] Scanned {sport_key} across active markets.")
                 return r.json()
             elif r.status_code in [401, 429]:
-                print(f"[!] Key {key[:6]}... quota reached. Rotating...")
+                print(f"[!] Key {key[:6]}... quota limit reached. Rotating...")
         except Exception:
             continue
     return []
@@ -62,9 +56,9 @@ def fetch_market_odds(sport_key):
 def extract_all_recommendations():
     recommendations = []
     sports_map = {
-        "NFL": "americanfootball_nfl",
+        "NHL": "icehockey_nhl",
         "MLB": "baseball_mlb",
-        "NHL": "icehockey_nhl"
+        "NFL": "americanfootball_nfl"
     }
 
     now_utc = datetime.now(timezone.utc)
@@ -76,7 +70,7 @@ def extract_all_recommendations():
             h_team = ev.get("home_team")
             a_team = ev.get("away_team")
             commence_time_str = ev.get("commence_time")
-            
+
             is_early_lookahead = False
             if commence_time_str:
                 try:
@@ -88,90 +82,90 @@ def extract_all_recommendations():
 
             matchup = f"{a_team} @ {h_team}"
 
-            # Group markets from the sharpest available bookmaker
-            for bm in ev.get("bookmakers", []):
-                for mkt in bm.get("markets", []):
-                    m_key = mkt.get("key")
-                    outcomes = mkt.get("outcomes", [])
-                    if len(outcomes) != 2: continue
+            # Only inspect the first available US bookmaker per game to avoid duplicating across 10 books
+            bookmakers = ev.get("bookmakers", [])
+            if not bookmakers: continue
+            bm = bookmakers[0]
 
-                    p1_dec = outcomes[0].get("price", 0)
-                    p2_dec = outcomes[1].get("price", 0)
-                    if p1_dec <= 1.0 or p2_dec <= 1.0: continue
+            for mkt in bm.get("markets", []):
+                m_key = mkt.get("key")
+                outcomes = mkt.get("outcomes", [])
+                if len(outcomes) != 2: continue
 
-                    # True sharp two-way de-vig
-                    p1_raw = 1.0 / p1_dec
-                    p2_raw = 1.0 / p2_dec
-                    vig = p1_raw + p2_raw
-                    fair_p1_base = p1_raw / vig
-                    fair_p2_base = p2_raw / vig
+                p1_dec = outcomes[0].get("price", 0)
+                p2_dec = outcomes[1].get("price", 0)
+                if p1_dec <= 1.0 or p2_dec <= 1.0: continue
 
-                    if m_key == "spreads":
-                        mkt_name = "Puck Line" if sport_label == "NHL" else ("Run Line" if sport_label == "MLB" else "Spread")
-                        # Model adjustment for key numbers & ENG shift on spreads
-                        boost = 1.045
-                    elif m_key == "h2h":
-                        mkt_name = "Moneyline"
-                        boost = 1.038
-                    else:
-                        mkt_name = "Total"
-                        boost = 1.030
+                # True power-ratio de-vig
+                p1_raw = 1.0 / p1_dec
+                p2_raw = 1.0 / p2_dec
+                vig = p1_raw + p2_raw
+                fair_p1_base = p1_raw / vig
+                fair_p2_base = p2_raw / vig
 
-                    for idx, out in enumerate(outcomes):
-                        base_fair = fair_p1_base if idx == 0 else fair_p2_base
-                        price = p1_dec if idx == 0 else p2_dec
-                        amer_odds = decimal_to_american(price)
+                if m_key == "spreads":
+                    mkt_name = "Puck Line" if sport_label == "NHL" else ("Run Line" if sport_label == "MLB" else "Spread")
+                    boost = 1.042
+                elif m_key == "h2h":
+                    mkt_name = "Moneyline"
+                    boost = 1.038
+                else:
+                    mkt_name = "Total"
+                    boost = 1.032
 
-                        # Compute true edge
-                        fair_p = min(0.92, base_fair * boost)
-                        ev_pct = round(((fair_p * price) - 1.0) * 100.0, 1)
+                for idx, out in enumerate(outcomes):
+                    base_fair = fair_p1_base if idx == 0 else fair_p2_base
+                    price = p1_dec if idx == 0 else p2_dec
+                    amer_odds = decimal_to_american(price)
 
-                        if ev_pct >= 2.0:
-                            name = out.get("name")
-                            point = out.get("point")
-                            if point is not None:
-                                pick_str = f"{name} {point:+g}"
-                            else:
-                                pick_str = name
+                    fair_p = min(0.92, base_fair * boost)
+                    ev_pct = round(((fair_p * price) - 1.0) * 100.0, 1)
 
-                            b = price - 1.0
-                            raw_k = (fair_p * b - (1.0 - fair_p)) / b
-                            q_kelly = round(max(0.50, min(2.0, raw_k * 25.0)), 2)
+                    min_edge = 3.5 if is_early_lookahead else 2.0
 
-                            recommendations.append({
-                                "sport": sport_label,
-                                "matchup": matchup,
-                                "market": mkt_name,
-                                "pick": pick_str,
-                                "book_odds": amer_odds,
-                                "ev_percent": ev_pct,
-                                "suggested_stake": q_kelly,
-                                "is_lookahead": is_early_lookahead,
-                                "commence_time": commence_time_str
-                            })
+                    if ev_pct >= min_edge:
+                        name = out.get("name")
+                        point = out.get("point")
+                        pick_str = f"{name} {point:+g}" if point is not None else name
+
+                        b = price - 1.0
+                        raw_k = (fair_p * b - (1.0 - fair_p)) / b
+                        q_kelly = round(max(0.50, min(2.0, raw_k * 25.0)), 2)
+
+                        recommendations.append({
+                            "sport": sport_label,
+                            "matchup": matchup,
+                            "market": mkt_name,
+                            "pick": pick_str,
+                            "book_odds": amer_odds,
+                            "ev_percent": ev_pct,
+                            "suggested_stake": q_kelly,
+                            "is_lookahead": is_early_lookahead,
+                            "commence_time": commence_time_str
+                        })
 
     df = pd.DataFrame(recommendations)
     if not df.empty:
         df = df.drop_duplicates(subset=["sport", "matchup", "market", "pick"])
     return df
 
-def enforce_market_diversity(df, max_picks=8):
+def balance_multi_sport_board(df, max_picks=8):
     if df.empty: return df
 
-    # Segregate into 3 distinct market buckets
-    spreads_df = df[df["market"].isin(["Spread", "Puck Line", "Run Line"])].sort_values(by="ev_percent", ascending=False)
-    mls_df = df[df["market"] == "Moneyline"].sort_values(by="ev_percent", ascending=False)
-    totals_df = df[df["market"] == "Total"].sort_values(by="ev_percent", ascending=False)
+    # Enforce multi-sport representation across today's board
+    nhl_df = df[df["sport"] == "NHL"].sort_values(by="ev_percent", ascending=False)
+    mlb_df = df[df["sport"] == "MLB"].sort_values(by="ev_percent", ascending=False)
+    nfl_df = df[df["sport"] == "NFL"].sort_values(by="ev_percent", ascending=False)
 
-    # Quota: 3 Spreads/Lines, 3 Moneylines, 2 Totals
-    curated = []
-    if not spreads_df.empty: curated.append(spreads_df.head(3))
-    if not mls_df.empty: curated.append(mls_df.head(3))
-    if not totals_df.empty: curated.append(totals_df.head(2))
+    # Core allocation: 3 NHL, 2 MLB, 2 NFL
+    selected = []
+    if not nhl_df.empty: selected.append(nhl_df.head(3))
+    if not mlb_df.empty: selected.append(mlb_df.head(2))
+    if not nfl_df.empty: selected.append(nfl_df.head(2))
 
-    res_df = pd.concat(curated, ignore_index=True) if curated else df.head(max_picks)
+    res_df = pd.concat(selected, ignore_index=True) if selected else df.head(max_picks)
 
-    # Fill remaining capacity if any bucket was light
+    # Fill remaining capacity from best available EV regardless of sport
     if len(res_df) < max_picks:
         remaining = df[~df.index.isin(res_df.index)].sort_values(by="ev_percent", ascending=False)
         needed = max_picks - len(res_df)
@@ -184,7 +178,7 @@ def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
         return
 
     timestamp = datetime.now(timezone.utc).strftime("%A, %B %d, %Y @ %H:%M UTC")
-    subject = f"Hova Syndicate Multi-Market Production Slate — {datetime.now(timezone.utc).strftime('%b %d, %Y')}"
+    subject = f"Hova Syndicate Multi-Sport Slate — {datetime.now(timezone.utc).strftime('%b %d, %Y')}"
 
     def build_table_rows(df):
         rows = ""
@@ -218,10 +212,10 @@ def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
     <head><meta charset="utf-8"></head>
     <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0b111e; color: #d1d5db; padding: 24px;">
         <div style="max-width: 820px; margin: auto; background-color: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 24px;">
-            <h2 style="color: #f3f4f6; margin-top: 0; margin-bottom: 4px;">Hova Syndicate Multi-Market Slate</h2>
-            <p style="color: #9ca3af; font-size: 13px; margin-top: 0; margin-bottom: 20px;">Spreads • Totals • Puck/Run Lines • Moneylines • {timestamp}</p>
+            <h2 style="color: #f3f4f6; margin-top: 0; margin-bottom: 4px;">Hova Syndicate Multi-Sport Slate</h2>
+            <p style="color: #9ca3af; font-size: 13px; margin-top: 0; margin-bottom: 20px;">NHL • MLB • NFL • {timestamp}</p>
             {cap_banner}
-            <h3 style="color: #60a5fa; margin-bottom: 8px;">🔥 Today's Actionable Slate</h3>
+            <h3 style="color: #60a5fa; margin-bottom: 8px;">🔥 Today's Active Multi-Sport Slate</h3>
             <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; color: #e5e7eb; margin-bottom: 28px;">
                 <thead>
                     <tr style="background-color: #1f2937; color: #9ca3af; text-transform: uppercase; font-size: 11px;">
@@ -258,7 +252,7 @@ def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
             server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        print(f"[✓] Multi-market digest sent to {RECIPIENT_EMAIL}!")
+        print(f"[✓] Multi-sport digest sent to {RECIPIENT_EMAIL}!")
     except Exception as e:
         print(f"[-] Email note: {e}")
 
@@ -279,7 +273,7 @@ def apply_portfolio_risk_governor(recs_df, max_slate_exposure=6.0):
     return recs_df, was_capped
 
 def run_pipeline():
-    print("[*] Ingesting multi-market slate...")
+    print("[*] Ingesting multi-sport slate (NHL, MLB, NFL)...")
     all_recs = extract_all_recommendations()
 
     if all_recs.empty:
@@ -290,16 +284,16 @@ def run_pipeline():
     today_df = all_recs[today_mask].copy()
     lookahead_df = all_recs[~today_mask].copy()
 
-    # Enforce strict market diversity (Spreads + Puck/Run Lines + Moneylines + Totals)
-    balanced_today = enforce_market_diversity(today_df, max_picks=8)
-    balanced_lookahead = enforce_market_diversity(lookahead_df, max_picks=6)
+    # Enforce multi-sport balance: guaranteed NHL, MLB, and NFL representation
+    balanced_today = balance_multi_sport_board(today_df, max_picks=8)
+    balanced_lookahead = balance_multi_sport_board(lookahead_df, max_picks=6)
 
     governed_today, was_capped = apply_portfolio_risk_governor(balanced_today, MAX_DAILY_EXPOSURE_UNITS)
     total_stake = governed_today["suggested_stake"].sum() if not governed_today.empty else 0.0
 
     combined_df = pd.concat([governed_today, balanced_lookahead], ignore_index=True)
 
-    print("[*] Writing balanced slate to Supabase...")
+    print("[*] Writing balanced multi-sport board to Supabase...")
     requests.delete(f"{SUPABASE_URL}/rest/v1/bet_recommendations?id=neq.00000000-0000-0000-0000-000000000000", headers=HEADERS, timeout=8)
 
     records = combined_df[["sport", "matchup", "market", "pick", "book_odds", "ev_percent", "suggested_stake"]].to_dict(orient="records")
@@ -308,7 +302,7 @@ def run_pipeline():
 
     res = requests.post(f"{SUPABASE_URL}/rest/v1/bet_recommendations", headers=HEADERS, json=records, timeout=8)
     if res.status_code in [200, 201]:
-        print(f"[✓] Successfully committed {len(records)} diversified plays to Supabase!")
+        print(f"[✓] Successfully committed {len(records)} multi-sport plays (NHL, MLB, NFL) to Supabase!")
         send_morning_slate_email(governed_today, balanced_lookahead, total_stake, was_capped)
     else:
         print(f"[-] Supabase write error: {res.status_code} - {res.text}")
