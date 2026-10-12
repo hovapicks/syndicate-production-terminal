@@ -73,14 +73,17 @@ def extract_all_recommendations():
             a_team = ev.get("away_team")
             commence_time_str = ev.get("commence_time")
 
-            is_early_lookahead = False
+            # Ignore any game that has already commenced or tipped off
             if commence_time_str:
                 try:
                     c_dt = datetime.fromisoformat(commence_time_str.replace("Z", "+00:00"))
-                    if c_dt > cutoff_30h:
-                        is_early_lookahead = True
+                    if c_dt <= now_utc:
+                        continue  # Skip live or finished games
+                    is_early_lookahead = (c_dt > cutoff_30h)
                 except Exception:
-                    pass
+                    is_early_lookahead = False
+            else:
+                is_early_lookahead = False
 
             matchup = f"{a_team} @ {h_team}"
 
@@ -147,6 +150,8 @@ def extract_all_recommendations():
                             "market": mkt_name,
                             "pick": pick_str,
                             "team_backed": name,
+                            "home_team": h_team,
+                            "away_team": a_team,
                             "book_odds": amer_odds,
                             "ev_percent": ev_pct,
                             "suggested_stake": q_kelly,
@@ -167,12 +172,32 @@ def extract_all_recommendations():
                 recommendations.append(game_total_candidates[0])
 
     df = pd.DataFrame(recommendations)
-    if not df.empty:
-        df = df.drop_duplicates(subset=["matchup", "market", "pick"])
     return df
+
+def filter_unique_teams(df):
+    """Ensures each team appears at most once across the actionable slate."""
+    if df.empty: return df
+    seen_teams = set()
+    unique_rows = []
+
+    # Prioritize highest EV first
+    df = df.sort_values(by="ev_percent", ascending=False)
+
+    for _, row in df.iterrows():
+        h = row.get("home_team")
+        a = row.get("away_team")
+        if h in seen_teams or a in seen_teams:
+            continue
+        seen_teams.add(h)
+        seen_teams.add(a)
+        unique_rows.append(row)
+
+    return pd.DataFrame(unique_rows)
 
 def balance_multi_sport_board(df, max_picks=8):
     if df.empty: return df
+
+    df = filter_unique_teams(df)
 
     nhl_df = df[df["sport"] == "NHL"].sort_values(by="ev_percent", ascending=False)
     mlb_df = df[df["sport"] == "MLB"].sort_values(by="ev_percent", ascending=False)
@@ -292,11 +317,11 @@ def apply_portfolio_risk_governor(recs_df, max_slate_exposure=6.0):
     return recs_df, was_capped
 
 def run_pipeline():
-    print("[*] Ingesting multi-sport slate with strict deduplication...")
+    print("[*] Ingesting multi-sport slate with strict live/past filtering...")
     all_recs = extract_all_recommendations()
 
     if all_recs.empty:
-        print("[-] Notice: No qualifying edges detected.")
+        print("[-] Notice: No qualifying edges detected for unstarted games.")
         return
 
     today_mask = all_recs["is_lookahead"] == False
@@ -309,11 +334,10 @@ def run_pipeline():
     governed_today, was_capped = apply_portfolio_risk_governor(balanced_today, MAX_DAILY_EXPOSURE_UNITS)
     total_stake = governed_today["suggested_stake"].sum() if not governed_today.empty else 0.0
 
-    print("[*] Writing deduplicated board to Supabase...")
+    print("[*] Writing cleaned board to Supabase...")
     requests.delete(f"{SUPABASE_URL}/rest/v1/bet_recommendations?id=neq.00000000-0000-0000-0000-000000000000", headers=HEADERS, timeout=8)
 
     combined_df = pd.concat([governed_today, balanced_lookahead], ignore_index=True)
-    # HARD DEDUPLICATION SAFEGUARD
     combined_df = combined_df.drop_duplicates(subset=["matchup", "market", "pick"])
 
     records = combined_df[["sport", "matchup", "market", "pick", "book_odds", "ev_percent", "suggested_stake"]].to_dict(orient="records")
@@ -322,7 +346,7 @@ def run_pipeline():
 
     res = requests.post(f"{SUPABASE_URL}/rest/v1/bet_recommendations", headers=HEADERS, json=records, timeout=8)
     if res.status_code in [200, 201]:
-        print(f"[✓] Committed {len(records)} unique, clean plays to Supabase!")
+        print(f"[✓] Committed {len(records)} clean plays to Supabase!")
         send_morning_slate_email(governed_today, balanced_lookahead, total_stake, was_capped)
     else:
         print(f"[-] Supabase write error: {res.status_code} - {res.text}")
