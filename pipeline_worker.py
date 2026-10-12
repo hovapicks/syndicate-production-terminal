@@ -45,10 +45,10 @@ def fetch_market_odds(sport_key):
         try:
             r = requests.get(url, params=params, timeout=10)
             if r.status_code == 200:
-                print(f"[✓] Successfully retrieved {sport_key} odds.")
+                print(f"[✓] Retrieved live {sport_key} odds.")
                 return r.json()
             elif r.status_code in [401, 429]:
-                print(f"[!] Key {key[:6]}... quota reached. Rotating...")
+                print(f"[!] Rotating key {key[:6]}...")
         except Exception:
             continue
     return []
@@ -56,9 +56,9 @@ def fetch_market_odds(sport_key):
 def extract_all_recommendations():
     recommendations = []
     sports_map = {
-        "NFL": "americanfootball_nfl",
+        "NHL": "icehockey_nhl",
         "MLB": "baseball_mlb",
-        "NHL": "icehockey_nhl"
+        "NFL": "americanfootball_nfl"
     }
 
     now_utc = datetime.now(timezone.utc)
@@ -104,22 +104,21 @@ def extract_all_recommendations():
 
                 if m_key == "spreads":
                     mkt_name = "Puck Line" if sport_label == "NHL" else ("Run Line" if sport_label == "MLB" else "Spread")
-                    fav_edge_bias = 0.024
+                    edge_bias = 0.024
                 elif m_key == "h2h":
                     mkt_name = "Moneyline"
-                    fav_edge_bias = 0.020
+                    edge_bias = 0.020
                 else:
                     mkt_name = "Total"
-                    fav_edge_bias = 0.018
+                    edge_bias = 0.018
 
                 # Asymmetric edge extraction: only one side can possess true value
-                diff = abs(fair_p1 - fair_p2)
                 if fair_p1 > fair_p2:
                     selected_idx = 0
-                    eval_fair = min(0.92, fair_p1 + fav_edge_bias)
+                    eval_fair = min(0.92, fair_p1 + edge_bias)
                 else:
                     selected_idx = 1
-                    eval_fair = min(0.92, fair_p2 + fav_edge_bias)
+                    eval_fair = min(0.92, fair_p2 + edge_bias)
 
                 best_outcome = outcomes[selected_idx]
                 best_price = best_outcome.get("price")
@@ -260,18 +259,15 @@ def run_pipeline():
         print("[-] Notice: No qualifying edges detected.")
         return
 
-    # Strictly separate Today (<30h) from Lookahead (>30h)
     today_df = all_recs[all_recs["is_lookahead"] == False].copy()
     lookahead_df = all_recs[all_recs["is_lookahead"] == True].copy()
 
-    # Cap today's active plays to 8 maximum
     today_df = today_df.sort_values(by="ev_percent", ascending=False).head(8)
     lookahead_df = lookahead_df.sort_values(by="ev_percent", ascending=False).head(6)
 
     governed_today, was_capped = apply_portfolio_risk_governor(today_df, MAX_DAILY_EXPOSURE_UNITS)
     total_stake = governed_today["suggested_stake"].sum() if not governed_today.empty else 0.0
 
-    # Clean write to Supabase
     print("[*] Writing clean board to Supabase...")
     requests.delete(f"{SUPABASE_URL}/rest/v1/bet_recommendations?id=neq.00000000-0000-0000-0000-000000000000", headers=HEADERS, timeout=8)
 
