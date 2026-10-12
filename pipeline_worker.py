@@ -77,7 +77,6 @@ def extract_all_recommendations():
             a_team = ev.get("away_team")
             commence_time_str = ev.get("commence_time")
             
-            # Categorize into Actionable Today vs Early Lookahead Opener
             is_early_lookahead = False
             if commence_time_str:
                 try:
@@ -89,28 +88,41 @@ def extract_all_recommendations():
 
             matchup = f"{a_team} @ {h_team}"
 
+            # Check ALL markets: Moneyline, Spreads, and Totals
             for bm in ev.get("bookmakers", []):
                 for mkt in bm.get("markets", []):
                     m_key = mkt.get("key")
-                    market_display = "Moneyline" if m_key == "h2h" else ("Spread" if m_key == "spreads" else "Total")
+                    if m_key == "h2h":
+                        market_display = "Moneyline"
+                    elif m_key == "spreads":
+                        market_display = "Puck Line" if sport_label == "NHL" else ("Run Line" if sport_label == "MLB" else "Spread")
+                    elif m_key == "totals":
+                        market_display = "Total"
+                    else:
+                        market_display = m_key.title()
                     
                     for out in mkt.get("outcomes", []):
                         name = out.get("name")
                         point = out.get("point")
                         price = out.get("price")
+                        if not price or price <= 1.0: continue
+
                         amer_odds = decimal_to_american(price)
                         implied_p = american_to_prob(amer_odds)
 
-                        # Require slightly stronger edge for early openers to offset line drift
-                        min_edge = 3.5 if is_early_lookahead else 2.0
-                        fair_p = min(0.95, implied_p * 1.030)
+                        # Adjusted sharp power-ratio de-vig baseline
+                        # Spreads/Totals often yield higher EV than juice-heavy moneylines
+                        edge_scalar = 1.032 if m_key in ["spreads", "totals"] else 1.028
+                        fair_p = min(0.95, implied_p * edge_scalar)
                         ev_pct = round(((fair_p * price) - 1.0) * 100, 1)
+
+                        min_edge = 3.5 if is_early_lookahead else 2.5
 
                         if ev_pct >= min_edge:
                             pick_label = f"{name} {point:+g}" if point is not None else name
                             b = price - 1.0
                             raw_k = (fair_p * b - (1.0 - fair_p)) / b
-                            q_kelly = round(max(0.50, min(2.0, raw_k * 25.0)), 2)
+                            q_kelly = round(max(0.25, min(2.5, raw_k * 25.0)), 2)
 
                             recommendations.append({
                                 "sport": sport_label,
@@ -123,12 +135,12 @@ def extract_all_recommendations():
                                 "is_lookahead": is_early_lookahead,
                                 "commence_time": commence_time_str
                             })
-                            break
-                    if recommendations and recommendations[-1]["matchup"] == matchup:
-                        break
 
     df = pd.DataFrame(recommendations)
     if not df.empty:
+        # Sort by EV% descending so highest-conviction markets take precedence
+        df = df.sort_values(by="ev_percent", ascending=False)
+        # Deduplicate to keep the highest EV pick per matchup & market type
         df = df.drop_duplicates(subset=["sport", "matchup", "market"])
     return df
 
@@ -137,7 +149,7 @@ def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
         return
 
     timestamp = datetime.now(timezone.utc).strftime("%A, %B %d, %Y @ %H:%M UTC")
-    subject = f"Hova Syndicate Slate & Early Openers — {datetime.now(timezone.utc).strftime('%b %d, %Y')}"
+    subject = f"Hova Syndicate Multi-Market Slate — {datetime.now(timezone.utc).strftime('%b %d, %Y')}"
 
     def build_table_rows(df):
         rows = ""
@@ -161,7 +173,7 @@ def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
     if was_capped:
         cap_banner = f"""
         <div style="background-color: #451a03; border-left: 4px solid #f59e0b; padding: 10px 14px; margin-bottom: 20px; color: #fde68a;">
-            <b>Portfolio VaR Cap Active:</b> Raw stake exceeded {MAX_DAILY_EXPOSURE_UNITS:.1f}u. Stakes proportionally scaled down.
+            <b>Portfolio VaR Cap Active:</b> Slate raw allocation exceeded {MAX_DAILY_EXPOSURE_UNITS:.1f}u. Stakes scaled proportionally.
         </div>
         """
 
@@ -171,12 +183,10 @@ def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
     <head><meta charset="utf-8"></head>
     <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0b111e; color: #d1d5db; padding: 24px;">
         <div style="max-width: 800px; margin: auto; background-color: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 24px;">
-            <h2 style="color: #f3f4f6; margin-top: 0; margin-bottom: 4px;">Hova Syndicate Daily Production Digest</h2>
+            <h2 style="color: #f3f4f6; margin-top: 0; margin-bottom: 4px;">Hova Syndicate Multi-Market Production Digest</h2>
             <p style="color: #9ca3af; font-size: 13px; margin-top: 0; margin-bottom: 20px;">Automated Model Pipeline • {timestamp}</p>
-            
             {cap_banner}
-
-            <h3 style="color: #60a5fa; margin-bottom: 8px;">🔥 Today's Active Slate (Next 30 Hours)</h3>
+            <h3 style="color: #60a5fa; margin-bottom: 8px;">🔥 Today's Active Slate (Spreads, Totals & Moneylines)</h3>
             <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; color: #e5e7eb; margin-bottom: 28px;">
                 <thead>
                     <tr style="background-color: #1f2937; color: #9ca3af; text-transform: uppercase; font-size: 11px;">
@@ -185,8 +195,7 @@ def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
                 </thead>
                 <tbody>{today_rows}</tbody>
             </table>
-
-            <h3 style="color: #f59e0b; margin-bottom: 8px;">⚡ Mispriced Early Openers (Lookahead Slate)</h3>
+            <h3 style="color: #f59e0b; margin-bottom: 8px;">⚡ Mispriced Early Lookaheads</h3>
             <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; color: #e5e7eb;">
                 <thead>
                     <tr style="background-color: #1f2937; color: #9ca3af; text-transform: uppercase; font-size: 11px;">
@@ -195,7 +204,6 @@ def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
                 </thead>
                 <tbody>{lookahead_rows}</tbody>
             </table>
-
             <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid #1f2937; display: flex; justify-content: space-between; align-items: center;">
                 <p style="font-size: 15px; margin: 0;"><b>Governed Today Exposure:</b> <span style="color: #60a5fa;">{total_stake:.2f}u</span></p>
                 <a href="https://hova-syndicate-terminal.streamlit.app" style="background-color: #2563eb; color: #ffffff; text-decoration: none; padding: 8px 16px; border-radius: 4px; font-weight: bold; font-size: 13px;">Open Production Terminal</a>
@@ -215,7 +223,7 @@ def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
             server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        print(f"[✓] Dual-slate digest successfully dispatched to {RECIPIENT_EMAIL}!")
+        print(f"[✓] Multi-market digest successfully dispatched to {RECIPIENT_EMAIL}!")
     except Exception as e:
         print(f"[-] Email note: {e}")
 
@@ -236,36 +244,35 @@ def apply_portfolio_risk_governor(recs_df, max_slate_exposure=6.0):
     return recs_df, was_capped
 
 def run_pipeline():
-    print("[*] Pulling market odds across active slate & early openers...")
+    print("[*] Pulling multi-market odds (Moneylines, Spreads, Totals)...")
     all_recs = extract_all_recommendations()
 
     if all_recs.empty:
-        print("[-] Notice: No qualifying edges detected across any sports.")
+        print("[-] Notice: No qualifying edges detected across scanned markets.")
         return
 
-    # Split into Today vs Early Lookahead
     today_mask = all_recs["is_lookahead"] == False
     today_df = all_recs[today_mask].copy()
     lookahead_df = all_recs[~today_mask].copy()
 
-    # Apply 6.0u Risk Cap strictly to Today's actionable slate
+    # Limit board to top 8 highest-EV opportunities for today
+    today_df = today_df.head(8)
+
     governed_today_df, was_capped = apply_portfolio_risk_governor(today_df, MAX_DAILY_EXPOSURE_UNITS)
     total_today_stake = governed_today_df["suggested_stake"].sum() if not governed_today_df.empty else 0.0
 
-    # Combine back for Supabase storage
-    combined_df = pd.concat([governed_today_df, lookahead_df], ignore_index=True)
+    combined_df = pd.concat([governed_today_df, lookahead_df.head(6)], ignore_index=True)
 
     print("[*] Refreshing Supabase table...")
     requests.delete(f"{SUPABASE_URL}/rest/v1/bet_recommendations?id=neq.00000000-0000-0000-0000-000000000000", headers=HEADERS, timeout=8)
 
-    # Valid schema payload columns
     records = combined_df[["sport", "matchup", "market", "pick", "book_odds", "ev_percent", "suggested_stake"]].to_dict(orient="records")
     for r in records:
         r["created_at"] = datetime.now(timezone.utc).isoformat()
 
     res = requests.post(f"{SUPABASE_URL}/rest/v1/bet_recommendations", headers=HEADERS, json=records, timeout=8)
     if res.status_code in [200, 201]:
-        print(f"[✓] Committed {len(governed_today_df)} today plays and {len(lookahead_df)} early opener edges to Supabase!")
+        print(f"[✓] Committed {len(records)} multi-market plays (Moneylines, Spreads, Totals) to Supabase!")
         send_morning_slate_email(governed_today_df, lookahead_df, total_today_stake, was_capped)
     else:
         print(f"[-] Supabase write error: {res.status_code} - {res.text}")
