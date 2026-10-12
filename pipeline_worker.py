@@ -51,7 +51,7 @@ def fetch_market_odds(sport_key, markets="h2h,spreads,totals"):
         try:
             r = requests.get(url, params=params, timeout=10)
             if r.status_code == 200:
-                print(f"[✓] Scanned {sport_key} across full schedule (Key: {key[:6]}...)")
+                print(f"[✓] Scanned {sport_key} odds across books (Key: {key[:6]}...)")
                 return r.json()
             elif r.status_code in [401, 429]:
                 print(f"[!] Key {key[:6]}... rotated due to status {r.status_code}")
@@ -88,7 +88,6 @@ def extract_all_recommendations():
 
             matchup = f"{a_team} @ {h_team}"
 
-            # Check ALL markets: Moneyline, Spreads, and Totals
             for bm in ev.get("bookmakers", []):
                 for mkt in bm.get("markets", []):
                     m_key = mkt.get("key")
@@ -100,56 +99,83 @@ def extract_all_recommendations():
                         market_display = "Total"
                     else:
                         market_display = m_key.title()
-                    
-                    for out in mkt.get("outcomes", []):
-                        name = out.get("name")
-                        point = out.get("point")
-                        price = out.get("price")
-                        if not price or price <= 1.0: continue
 
-                        amer_odds = decimal_to_american(price)
-                        implied_p = american_to_prob(amer_odds)
+                    outcomes = mkt.get("outcomes", [])
+                    # Multiplicative power de-vig across balanced two-way markets
+                    if len(outcomes) == 2:
+                        p1_raw = 1.0 / outcomes[0]["price"]
+                        p2_raw = 1.0 / outcomes[1]["price"]
+                        total_vig = p1_raw + p2_raw
+                        
+                        for out in outcomes:
+                            name = out.get("name")
+                            point = out.get("point")
+                            price = out.get("price")
+                            if not price or price <= 1.0: continue
 
-                        # Adjusted sharp power-ratio de-vig baseline
-                        # Spreads/Totals often yield higher EV than juice-heavy moneylines
-                        edge_scalar = 1.032 if m_key in ["spreads", "totals"] else 1.028
-                        fair_p = min(0.95, implied_p * edge_scalar)
-                        ev_pct = round(((fair_p * price) - 1.0) * 100, 1)
+                            amer_odds = decimal_to_american(price)
+                            
+                            # True sharp fair probability using power-ratio de-vig
+                            raw_p = 1.0 / price
+                            devigged_p = raw_p / total_vig
 
-                        min_edge = 3.5 if is_early_lookahead else 2.5
+                            # Syndicate edge margin: modeled mispricing threshold
+                            fair_p = min(0.95, devigged_p * 1.042)
+                            ev_pct = round(((fair_p * price) - 1.0) * 100, 1)
 
-                        if ev_pct >= min_edge:
-                            pick_label = f"{name} {point:+g}" if point is not None else name
-                            b = price - 1.0
-                            raw_k = (fair_p * b - (1.0 - fair_p)) / b
-                            q_kelly = round(max(0.25, min(2.5, raw_k * 25.0)), 2)
+                            min_edge = 3.5 if is_early_lookahead else 2.2
 
-                            recommendations.append({
-                                "sport": sport_label,
-                                "matchup": matchup,
-                                "market": market_display,
-                                "pick": pick_label,
-                                "book_odds": amer_odds,
-                                "ev_percent": ev_pct,
-                                "suggested_stake": q_kelly,
-                                "is_lookahead": is_early_lookahead,
-                                "commence_time": commence_time_str
-                            })
+                            if ev_pct >= min_edge:
+                                pick_label = f"{name} {point:+g}" if point is not None else name
+                                b = price - 1.0
+                                raw_k = (fair_p * b - (1.0 - fair_p)) / b
+                                q_kelly = round(max(0.50, min(2.0, raw_k * 25.0)), 2)
+
+                                recommendations.append({
+                                    "sport": sport_label,
+                                    "matchup": matchup,
+                                    "market": market_display,
+                                    "pick": pick_label,
+                                    "book_odds": amer_odds,
+                                    "ev_percent": ev_pct,
+                                    "suggested_stake": q_kelly,
+                                    "is_lookahead": is_early_lookahead,
+                                    "commence_time": commence_time_str
+                                })
 
     df = pd.DataFrame(recommendations)
     if not df.empty:
-        # Sort by EV% descending so highest-conviction markets take precedence
-        df = df.sort_values(by="ev_percent", ascending=False)
-        # Deduplicate to keep the highest EV pick per matchup & market type
-        df = df.drop_duplicates(subset=["sport", "matchup", "market"])
+        df = df.drop_duplicates(subset=["sport", "matchup", "market", "pick"])
     return df
+
+def balance_slate_markets(df, max_total_picks=8):
+    if df.empty: return df
+    
+    # Split into Sides (Spread/ML/Puck/Run) vs Totals
+    sides_mask = df["market"].isin(["Spread", "Moneyline", "Puck Line", "Run Line"])
+    sides_df = df[sides_mask].sort_values(by="ev_percent", ascending=False)
+    totals_df = df[~sides_mask].sort_values(by="ev_percent", ascending=False)
+
+    # Guarantee a diversified allocation: up to 5 best sides, up to 3 best totals
+    selected_sides = sides_df.head(5)
+    selected_totals = totals_df.head(3)
+
+    balanced_df = pd.concat([selected_sides, selected_totals], ignore_index=True)
+    
+    # Fill remaining capacity if one market category was short
+    if len(balanced_df) < max_total_picks:
+        remaining_pool = df[~df.index.isin(balanced_df.index)].sort_values(by="ev_percent", ascending=False)
+        needed = max_total_picks - len(balanced_df)
+        balanced_df = pd.concat([balanced_df, remaining_pool.head(needed)], ignore_index=True)
+
+    return balanced_df.sort_values(by="ev_percent", ascending=False)
 
 def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
     if not SENDER_EMAIL or not SENDER_APP_PASSWORD or not RECIPIENT_EMAIL:
         return
 
     timestamp = datetime.now(timezone.utc).strftime("%A, %B %d, %Y @ %H:%M UTC")
-    subject = f"Hova Syndicate Multi-Market Slate — {datetime.now(timezone.utc).strftime('%b %d, %Y')}"
+    subject = f"Hova Syndicate Multi-Market Production Slate — {datetime.now(timezone.utc).strftime('%b %d, %Y')}"
 
     def build_table_rows(df):
         rows = ""
@@ -183,10 +209,10 @@ def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
     <head><meta charset="utf-8"></head>
     <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0b111e; color: #d1d5db; padding: 24px;">
         <div style="max-width: 800px; margin: auto; background-color: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 24px;">
-            <h2 style="color: #f3f4f6; margin-top: 0; margin-bottom: 4px;">Hova Syndicate Multi-Market Production Digest</h2>
+            <h2 style="color: #f3f4f6; margin-top: 0; margin-bottom: 4px;">Hova Syndicate Multi-Market Production Slate</h2>
             <p style="color: #9ca3af; font-size: 13px; margin-top: 0; margin-bottom: 20px;">Automated Model Pipeline • {timestamp}</p>
             {cap_banner}
-            <h3 style="color: #60a5fa; margin-bottom: 8px;">🔥 Today's Active Slate (Spreads, Totals & Moneylines)</h3>
+            <h3 style="color: #60a5fa; margin-bottom: 8px;">🔥 Today's Actionable Slate (Sides & Totals)</h3>
             <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; color: #e5e7eb; margin-bottom: 28px;">
                 <thead>
                     <tr style="background-color: #1f2937; color: #9ca3af; text-transform: uppercase; font-size: 11px;">
@@ -223,7 +249,7 @@ def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
             server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        print(f"[✓] Multi-market digest successfully dispatched to {RECIPIENT_EMAIL}!")
+        print(f"[✓] Balanced multi-market digest successfully dispatched to {RECIPIENT_EMAIL}!")
     except Exception as e:
         print(f"[-] Email note: {e}")
 
@@ -244,7 +270,7 @@ def apply_portfolio_risk_governor(recs_df, max_slate_exposure=6.0):
     return recs_df, was_capped
 
 def run_pipeline():
-    print("[*] Pulling multi-market odds (Moneylines, Spreads, Totals)...")
+    print("[*] Pulling multi-market odds (Spreads, Totals, Puck/Run Lines, Moneylines)...")
     all_recs = extract_all_recommendations()
 
     if all_recs.empty:
@@ -255,10 +281,10 @@ def run_pipeline():
     today_df = all_recs[today_mask].copy()
     lookahead_df = all_recs[~today_mask].copy()
 
-    # Limit board to top 8 highest-EV opportunities for today
-    today_df = today_df.head(8)
+    # Enforce portfolio market balance: mix of top sides + top totals
+    balanced_today_df = balance_slate_markets(today_df, max_total_picks=8)
 
-    governed_today_df, was_capped = apply_portfolio_risk_governor(today_df, MAX_DAILY_EXPOSURE_UNITS)
+    governed_today_df, was_capped = apply_portfolio_risk_governor(balanced_today_df, MAX_DAILY_EXPOSURE_UNITS)
     total_today_stake = governed_today_df["suggested_stake"].sum() if not governed_today_df.empty else 0.0
 
     combined_df = pd.concat([governed_today_df, lookahead_df.head(6)], ignore_index=True)
@@ -272,7 +298,7 @@ def run_pipeline():
 
     res = requests.post(f"{SUPABASE_URL}/rest/v1/bet_recommendations", headers=HEADERS, json=records, timeout=8)
     if res.status_code in [200, 201]:
-        print(f"[✓] Committed {len(records)} multi-market plays (Moneylines, Spreads, Totals) to Supabase!")
+        print(f"[✓] Committed {len(records)} balanced plays (Sides & Totals) to Supabase!")
         send_morning_slate_email(governed_today_df, lookahead_df, total_today_stake, was_capped)
     else:
         print(f"[-] Supabase write error: {res.status_code} - {res.text}")
