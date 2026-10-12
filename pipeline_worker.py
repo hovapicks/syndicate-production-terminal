@@ -112,7 +112,6 @@ def extract_all_recommendations():
                     market_buckets[m_key][k1].append({"price": p1_dec, "fair": p1_fair})
                     market_buckets[m_key][k2].append({"price": p2_dec, "fair": p2_fair})
 
-            # Process candidate picks
             game_side_candidates = []
             game_total_candidates = []
 
@@ -159,18 +158,17 @@ def extract_all_recommendations():
                         else:
                             game_side_candidates.append(item)
 
-            # Strictly enforce one directional side per game (Moneyline OR Spread)
             if game_side_candidates:
                 game_side_candidates.sort(key=lambda x: x["ev_percent"], reverse=True)
-                # Keep only the single highest-EV side play for this matchup
                 recommendations.append(game_side_candidates[0])
 
-            # Allow at most one total for the game
             if game_total_candidates:
                 game_total_candidates.sort(key=lambda x: x["ev_percent"], reverse=True)
                 recommendations.append(game_total_candidates[0])
 
     df = pd.DataFrame(recommendations)
+    if not df.empty:
+        df = df.drop_duplicates(subset=["matchup", "market", "pick"])
     return df
 
 def balance_multi_sport_board(df, max_picks=8):
@@ -192,7 +190,7 @@ def balance_multi_sport_board(df, max_picks=8):
         needed = max_picks - len(res_df)
         res_df = pd.concat([res_df, remaining.head(needed)], ignore_index=True)
 
-    return res_df.sort_values(by="ev_percent", ascending=False).head(max_picks)
+    return res_df.sort_values(by="ev_percent", ascending=False).drop_duplicates(subset=["matchup", "market", "pick"]).head(max_picks)
 
 def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
     if not SENDER_EMAIL or not SENDER_APP_PASSWORD or not RECIPIENT_EMAIL:
@@ -234,7 +232,7 @@ def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
     <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0b111e; color: #d1d5db; padding: 24px;">
         <div style="max-width: 820px; margin: auto; background-color: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 24px;">
             <h2 style="color: #f3f4f6; margin-top: 0; margin-bottom: 4px;">Hova Syndicate Multi-Sport Slate</h2>
-            <p style="color: #9ca3af; font-size: 13px; margin-top: 0; margin-bottom: 20px;">NHL • MLB • NFL • {timestamp}</p>
+            <p style="color: #9ca3af; font-size: 13px; margin-top: 0; margin-bottom: 20px;">Automated Model Pipeline • {timestamp}</p>
             {cap_banner}
             <h3 style="color: #60a5fa; margin-bottom: 8px;">🔥 Today's Active Slate</h3>
             <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; color: #e5e7eb; margin-bottom: 28px;">
@@ -294,7 +292,7 @@ def apply_portfolio_risk_governor(recs_df, max_slate_exposure=6.0):
     return recs_df, was_capped
 
 def run_pipeline():
-    print("[*] Ingesting multi-sport slate with single-side game resolution...")
+    print("[*] Ingesting multi-sport slate with strict deduplication...")
     all_recs = extract_all_recommendations()
 
     if all_recs.empty:
@@ -311,17 +309,20 @@ def run_pipeline():
     governed_today, was_capped = apply_portfolio_risk_governor(balanced_today, MAX_DAILY_EXPOSURE_UNITS)
     total_stake = governed_today["suggested_stake"].sum() if not governed_today.empty else 0.0
 
-    print("[*] Writing directional board to Supabase...")
+    print("[*] Writing deduplicated board to Supabase...")
     requests.delete(f"{SUPABASE_URL}/rest/v1/bet_recommendations?id=neq.00000000-0000-0000-0000-000000000000", headers=HEADERS, timeout=8)
 
     combined_df = pd.concat([governed_today, balanced_lookahead], ignore_index=True)
+    # HARD DEDUPLICATION SAFEGUARD
+    combined_df = combined_df.drop_duplicates(subset=["matchup", "market", "pick"])
+
     records = combined_df[["sport", "matchup", "market", "pick", "book_odds", "ev_percent", "suggested_stake"]].to_dict(orient="records")
     for r in records:
         r["created_at"] = datetime.now(timezone.utc).isoformat()
 
     res = requests.post(f"{SUPABASE_URL}/rest/v1/bet_recommendations", headers=HEADERS, json=records, timeout=8)
     if res.status_code in [200, 201]:
-        print(f"[✓] Committed {len(records)} clean directional plays to Supabase!")
+        print(f"[✓] Committed {len(records)} unique, clean plays to Supabase!")
         send_morning_slate_email(governed_today, balanced_lookahead, total_stake, was_capped)
     else:
         print(f"[-] Supabase write error: {res.status_code} - {res.text}")

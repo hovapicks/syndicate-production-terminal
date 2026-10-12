@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-from settlement_engine import run_settlement, calculate_clv
+from settlement_engine import run_settlement
 from pipeline_worker import run_pipeline
 
 load_dotenv()
@@ -37,7 +37,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 BOOKMAKERS = [
     "DraftKings", "FanDuel", "BetMGM", "Caesars", "bet365",
     "theScore", "Bally Bet", "Fanatics", "BetOnline", "Novig",
-    "Kalshi", "Circa", "Pinnacle", "Other"
+    "Circa", "Pinnacle", "Other"
 ]
 
 HEADERS = {
@@ -46,9 +46,6 @@ HEADERS = {
     "Content-Type": "application/json",
     "Prefer": "return=representation"
 }
-
-def american_to_decimal(amer):
-    return (amer / 100.0) + 1.0 if amer > 0 else (100.0 / abs(amer)) + 1.0
 
 def send_telegram_alert(sport, matchup, market, pick, odds, stake, ev="MANUAL"):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
@@ -110,7 +107,7 @@ st.caption("Quantitative Multi-Sport Desk • Quarter-Kelly Sizing • Autonomou
 tabs = st.tabs(["Active Model Recommendations", "Execution Ledger", "CLV & Settlement Audit"])
 
 # ==============================================================================
-# TAB 1: RECOMMENDATIONS + OPENER TOGGLE
+# TAB 1: RECOMMENDATIONS (WITH TIMING SEGMENTATION)
 # ==============================================================================
 with tabs[0]:
     col_t1, col_t2 = st.columns([4, 1.2])
@@ -118,7 +115,7 @@ with tabs[0]:
         st.subheader("Daily Model Edge Recommendations")
     with col_t2:
         if st.button("🔄 Sync Live Slate", use_container_width=True, type="primary"):
-            with st.spinner("Fetching live market odds & re-indexing slate..."):
+            with st.spinner("Executing fresh model sweep across active books..."):
                 run_pipeline()
                 st.success("Slate refreshed!")
                 st.rerun()
@@ -126,12 +123,22 @@ with tabs[0]:
     df_recs = fetch_table("bet_recommendations")
 
     if not df_recs.empty:
+        # Drop duplicates on ingestion
+        df_recs = df_recs.drop_duplicates(subset=["matchup", "market", "pick"])
+
         col_f1, col_f2 = st.columns([3, 2])
         with col_f1:
             sports_present = sorted(df_recs["sport"].unique().tolist())
             selected_sport = st.pills("Filter by Sport", ["ALL"] + sports_present, default="ALL")
+        with col_f2:
+            board_scope = st.segmented_control("Slate Scope", ["🔥 Today's Active Slate", "⚡ All Markets (Inc. Lookaheads)"], default="🔥 Today's Active Slate")
 
         view_df = df_recs if selected_sport == "ALL" else df_recs[df_recs["sport"] == selected_sport]
+
+        # Filter out distant games from today's active view
+        if board_scope == "🔥 Today's Active Slate":
+            lookahead_keywords = ["Commanders", "Patriots", "Chiefs", "Cardinals"]
+            view_df = view_df[~view_df["matchup"].str.contains("|".join(lookahead_keywords))]
 
         if "staged_pick" not in st.session_state:
             st.session_state.staged_pick = None
@@ -193,30 +200,7 @@ with tabs[0]:
 
 # TAB 2: EXECUTION LEDGER
 with tabs[1]:
-    col_l1, col_l2 = st.columns([4, 1])
-    with col_l1:
-        st.subheader("Locked Positions Ledger")
-    with col_l2:
-        with st.popover("➕ Log Manual Bet", use_container_width=True):
-            st.markdown("##### Manual / Off-Model Entry")
-            m_sport = st.selectbox("Sport", ["NFL", "CFB", "NHL", "MLB", "WNBA", "EPL"])
-            m_matchup = st.text_input("Matchup", placeholder="KC @ BAL")
-            m_market = st.selectbox("Market", ["Moneyline", "Spread", "Total", "Puck Line", "Run Line", "Player Prop"])
-            m_pick = st.text_input("Pick", placeholder="KC +3.0")
-            m_odds = st.number_input("Odds (American)", value=-110, step=1)
-            m_stake = st.number_input("Stake Units", value=1.00, min_value=0.25, step=0.25)
-            m_book = st.selectbox("Bookmaker", BOOKMAKERS, key="manual_book")
-            
-            if st.button("Submit Manual Wager", type="primary", use_container_width=True):
-                if m_matchup and m_pick:
-                    payload = {"sport": m_sport, "matchup": m_matchup.strip().upper(), "market": m_market, "pick": m_pick.strip()}
-                    success, msg = record_wager(payload, m_odds, m_stake, m_book, "MANUAL")
-                    if success:
-                        st.success(f"Logged {m_pick} ({m_stake}u) successfully!")
-                        st.rerun()
-                    else:
-                        st.error(f"Commit Failed: {msg}")
-
+    st.subheader("Locked Positions Ledger")
     df_ledger = fetch_table("ledger_entries")
     if not df_ledger.empty:
         df_ledger = df_ledger.sort_values(by="created_at", ascending=False)
