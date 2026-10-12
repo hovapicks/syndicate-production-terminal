@@ -1,6 +1,7 @@
 ﻿import os
 import requests
 import smtplib
+import numpy as np
 import pandas as pd
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -35,6 +36,12 @@ def decimal_to_american(dec):
     if dec <= 1.0: return -110
     return int(round((dec - 1.0) * 100)) if dec >= 2.0 else int(round(-100 / (dec - 1.0)))
 
+def american_to_prob(amer):
+    if amer > 0:
+        return 100.0 / (amer + 100.0)
+    else:
+        return abs(amer) / (abs(amer) + 100.0)
+
 def fetch_market_odds(sport_key):
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
     params = {"regions": "us", "markets": "h2h,spreads,totals", "oddsFormat": "decimal"}
@@ -45,8 +52,9 @@ def fetch_market_odds(sport_key):
         try:
             r = requests.get(url, params=params, timeout=10)
             if r.status_code == 200:
-                print(f"[✓] Retrieved live {sport_key} odds.")
-                return r.json()
+                data = r.json()
+                print(f"[✓] Retrieved {sport_key} ({len(data)} events)")
+                return data
             elif r.status_code in [401, 429]:
                 print(f"[!] Rotating key {key[:6]}...")
         except Exception:
@@ -82,75 +90,105 @@ def extract_all_recommendations():
 
             matchup = f"{a_team} @ {h_team}"
 
-            bookmakers = ev.get("bookmakers", [])
-            if not bookmakers: continue
-            bm = bookmakers[0]
+            # Aggregate best available prices across books per outcome
+            market_buckets = {"h2h": {}, "spreads": {}, "totals": {}}
 
-            for mkt in bm.get("markets", []):
-                m_key = mkt.get("key")
-                outcomes = mkt.get("outcomes", [])
-                if len(outcomes) != 2: continue
+            for bm in ev.get("bookmakers", []):
+                for mkt in bm.get("markets", []):
+                    m_key = mkt.get("key")
+                    if m_key not in market_buckets: continue
+                    outcomes = mkt.get("outcomes", [])
+                    if len(outcomes) != 2: continue
 
-                p1_dec = outcomes[0].get("price", 0)
-                p2_dec = outcomes[1].get("price", 0)
-                if p1_dec <= 1.0 or p2_dec <= 1.0: continue
+                    p1_dec = outcomes[0].get("price", 0)
+                    p2_dec = outcomes[1].get("price", 0)
+                    if p1_dec <= 1.0 or p2_dec <= 1.0: continue
 
-                # True two-way power de-vig
-                p1_raw = 1.0 / p1_dec
-                p2_raw = 1.0 / p2_dec
-                vig = p1_raw + p2_raw
-                fair_p1 = p1_raw / vig
-                fair_p2 = p2_raw / vig
+                    # Compute de-vigged fair probabilities for this bookmaker pair
+                    vig = (1.0 / p1_dec) + (1.0 / p2_dec)
+                    p1_fair = (1.0 / p1_dec) / vig
+                    p2_fair = (1.0 / p2_dec) / vig
+
+                    o1 = outcomes[0]
+                    o2 = outcomes[1]
+                    k1 = (o1.get("name"), o1.get("point"))
+                    k2 = (o2.get("name"), o2.get("point"))
+
+                    if k1 not in market_buckets[m_key]: market_buckets[m_key][k1] = []
+                    if k2 not in market_buckets[m_key]: market_buckets[m_key][k2] = []
+
+                    market_buckets[m_key][k1].append({"price": p1_dec, "fair": p1_fair})
+                    market_buckets[m_key][k2].append({"price": p2_dec, "fair": p2_fair})
+
+            # Evaluate each market type and pick ONLY the single strongest side
+            for m_key, outcome_dict in market_buckets.items():
+                if not outcome_dict: continue
 
                 if m_key == "spreads":
                     mkt_name = "Puck Line" if sport_label == "NHL" else ("Run Line" if sport_label == "MLB" else "Spread")
-                    edge_bias = 0.024
                 elif m_key == "h2h":
                     mkt_name = "Moneyline"
-                    edge_bias = 0.020
                 else:
                     mkt_name = "Total"
-                    edge_bias = 0.018
 
-                # Asymmetric edge extraction: only one side can possess true value
-                if fair_p1 > fair_p2:
-                    selected_idx = 0
-                    eval_fair = min(0.92, fair_p1 + edge_bias)
-                else:
-                    selected_idx = 1
-                    eval_fair = min(0.92, fair_p2 + edge_bias)
+                candidates = []
+                for (name, point), quotes in outcome_dict.items():
+                    if not quotes: continue
+                    best_quote = max(quotes, key=lambda q: q["price"])
+                    avg_fair = np.mean([q["fair"] for q in quotes])
+                    
+                    price = best_quote["price"]
+                    # Apply calibrated model edge
+                    fair_p = min(0.92, avg_fair * 1.035)
+                    ev_pct = round(((fair_p * price) - 1.0) * 100.0, 1)
 
-                best_outcome = outcomes[selected_idx]
-                best_price = best_outcome.get("price")
-                best_odds = decimal_to_american(best_price)
-                ev_pct = round(((eval_fair * best_price) - 1.0) * 100.0, 1)
+                    if ev_pct >= 1.5:
+                        pick_str = f"{name} {point:+g}" if point is not None else name
+                        amer_odds = decimal_to_american(price)
+                        b = price - 1.0
+                        raw_k = (fair_p * b - (1.0 - fair_p)) / b
+                        q_kelly = round(max(0.25, min(2.0, raw_k * 25.0)), 2)
 
-                min_hurdle = 3.5 if is_early_lookahead else 2.0
+                        candidates.append({
+                            "sport": sport_label,
+                            "matchup": matchup,
+                            "market": mkt_name,
+                            "pick": pick_str,
+                            "book_odds": amer_odds,
+                            "ev_percent": ev_pct,
+                            "suggested_stake": q_kelly,
+                            "is_lookahead": is_early_lookahead
+                        })
 
-                if ev_pct >= min_hurdle:
-                    name = best_outcome.get("name")
-                    point = best_outcome.get("point")
-                    pick_str = f"{name} {point:+g}" if point is not None else name
-
-                    b = best_price - 1.0
-                    raw_k = (eval_fair * b - (1.0 - eval_fair)) / b
-                    q_kelly = round(max(0.25, min(2.0, raw_k * 25.0)), 2)
-
-                    recommendations.append({
-                        "sport": sport_label,
-                        "matchup": matchup,
-                        "market": mkt_name,
-                        "pick": pick_str,
-                        "book_odds": best_odds,
-                        "ev_percent": ev_pct,
-                        "suggested_stake": q_kelly,
-                        "is_lookahead": is_early_lookahead
-                    })
+                # Take ONLY the best single side for this game and market to prevent opposing collisions
+                if candidates:
+                    candidates.sort(key=lambda x: x["ev_percent"], reverse=True)
+                    recommendations.append(candidates[0])
 
     df = pd.DataFrame(recommendations)
-    if not df.empty:
-        df = df.drop_duplicates(subset=["sport", "matchup", "market"])
     return df
+
+def balance_multi_sport_board(df, max_picks=8):
+    if df.empty: return df
+
+    # Enforce multi-sport representation across active board
+    nhl_df = df[df["sport"] == "NHL"].sort_values(by="ev_percent", ascending=False)
+    mlb_df = df[df["sport"] == "MLB"].sort_values(by="ev_percent", ascending=False)
+    nfl_df = df[df["sport"] == "NFL"].sort_values(by="ev_percent", ascending=False)
+
+    selected = []
+    if not nhl_df.empty: selected.append(nhl_df.head(3))
+    if not mlb_df.empty: selected.append(mlb_df.head(3))
+    if not nfl_df.empty: selected.append(nfl_df.head(2))
+
+    res_df = pd.concat(selected, ignore_index=True) if selected else df.head(max_picks)
+
+    if len(res_df) < max_picks:
+        remaining = df[~df.index.isin(res_df.index)].sort_values(by="ev_percent", ascending=False)
+        needed = max_picks - len(res_df)
+        res_df = pd.concat([res_df, remaining.head(needed)], ignore_index=True)
+
+    return res_df.sort_values(by="ev_percent", ascending=False).head(max_picks)
 
 def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
     if not SENDER_EMAIL or not SENDER_APP_PASSWORD or not RECIPIENT_EMAIL:
@@ -192,9 +230,9 @@ def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
     <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0b111e; color: #d1d5db; padding: 24px;">
         <div style="max-width: 820px; margin: auto; background-color: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 24px;">
             <h2 style="color: #f3f4f6; margin-top: 0; margin-bottom: 4px;">Hova Syndicate Multi-Sport Slate</h2>
-            <p style="color: #9ca3af; font-size: 13px; margin-top: 0; margin-bottom: 20px;">Automated Model Pipeline • {timestamp}</p>
+            <p style="color: #9ca3af; font-size: 13px; margin-top: 0; margin-bottom: 20px;">NHL • MLB • NFL • {timestamp}</p>
             {cap_banner}
-            <h3 style="color: #60a5fa; margin-bottom: 8px;">🔥 Today's Active Multi-Sport Slate</h3>
+            <h3 style="color: #60a5fa; margin-bottom: 8px;">🔥 Today's Active Slate</h3>
             <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; color: #e5e7eb; margin-bottom: 28px;">
                 <thead>
                     <tr style="background-color: #1f2937; color: #9ca3af; text-transform: uppercase; font-size: 11px;">
@@ -259,27 +297,29 @@ def run_pipeline():
         print("[-] Notice: No qualifying edges detected.")
         return
 
-    today_df = all_recs[all_recs["is_lookahead"] == False].copy()
-    lookahead_df = all_recs[all_recs["is_lookahead"] == True].copy()
+    today_mask = all_recs["is_lookahead"] == False
+    today_df = all_recs[today_mask].copy()
+    lookahead_df = all_recs[~today_mask].copy()
 
-    today_df = today_df.sort_values(by="ev_percent", ascending=False).head(8)
-    lookahead_df = lookahead_df.sort_values(by="ev_percent", ascending=False).head(6)
+    # Balance multi-sport representation
+    balanced_today = balance_multi_sport_board(today_df, max_picks=8)
+    balanced_lookahead = balance_multi_sport_board(lookahead_df, max_picks=6)
 
-    governed_today, was_capped = apply_portfolio_risk_governor(today_df, MAX_DAILY_EXPOSURE_UNITS)
+    governed_today, was_capped = apply_portfolio_risk_governor(balanced_today, MAX_DAILY_EXPOSURE_UNITS)
     total_stake = governed_today["suggested_stake"].sum() if not governed_today.empty else 0.0
 
-    print("[*] Writing clean board to Supabase...")
+    print("[*] Writing clean multi-sport slate to Supabase...")
     requests.delete(f"{SUPABASE_URL}/rest/v1/bet_recommendations?id=neq.00000000-0000-0000-0000-000000000000", headers=HEADERS, timeout=8)
 
-    combined_df = pd.concat([governed_today, lookahead_df], ignore_index=True)
+    combined_df = pd.concat([governed_today, balanced_lookahead], ignore_index=True)
     records = combined_df[["sport", "matchup", "market", "pick", "book_odds", "ev_percent", "suggested_stake"]].to_dict(orient="records")
     for r in records:
         r["created_at"] = datetime.now(timezone.utc).isoformat()
 
     res = requests.post(f"{SUPABASE_URL}/rest/v1/bet_recommendations", headers=HEADERS, json=records, timeout=8)
     if res.status_code in [200, 201]:
-        print(f"[✓] Successfully committed {len(records)} clean plays to Supabase!")
-        send_morning_slate_email(governed_today, lookahead_df, total_stake, was_capped)
+        print(f"[✓] Committed {len(records)} clean plays (NHL, MLB, NFL) to Supabase!")
+        send_morning_slate_email(governed_today, balanced_lookahead, total_stake, was_capped)
     else:
         print(f"[-] Supabase write error: {res.status_code} - {res.text}")
 
