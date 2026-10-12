@@ -49,10 +49,14 @@ def fetch_market_odds(sport_key, markets="h2h,spreads,totals"):
         if not key: continue
         params["apiKey"] = key
         try:
-            r = requests.get(url, params=params, timeout=8)
+            r = requests.get(url, params=params, timeout=10)
             if r.status_code == 200:
+                print(f"[✓] Successfully retrieved {sport_key} odds (Key: {key[:6]}...)")
                 return r.json()
-        except Exception:
+            elif r.status_code in [401, 429]:
+                print(f"[!] Key {key[:6]}... quota reached or unauthorized ({r.status_code}). Rotating...")
+        except Exception as e:
+            print(f"[-] API connection failed for {sport_key}: {e}")
             continue
     return []
 
@@ -65,7 +69,10 @@ def extract_live_recommendations():
     }
 
     for sport_label, sport_key in sports_map.items():
+        print(f"[*] Scanning {sport_label} markets...")
         events = fetch_market_odds(sport_key)
+        print(f"    Found {len(events)} upcoming/active events for {sport_label}")
+
         for ev in events:
             h_team = ev.get("home_team")
             a_team = ev.get("away_team")
@@ -83,14 +90,14 @@ def extract_live_recommendations():
                         amer_odds = decimal_to_american(price)
                         implied_p = american_to_prob(amer_odds)
 
-                        fair_p = implied_p * 1.035
+                        fair_p = min(0.95, implied_p * 1.030)
                         ev_pct = round(((fair_p * price) - 1.0) * 100, 1)
 
-                        if ev_pct >= 3.5:
+                        if ev_pct >= 2.0:
                             pick_label = f"{name} {point:+g}" if point is not None else name
                             b = price - 1.0
                             raw_k = (fair_p * b - (1.0 - fair_p)) / b
-                            q_kelly = round(max(0.25, min(2.5, raw_k * 25.0)), 2)
+                            q_kelly = round(max(0.50, min(2.0, raw_k * 25.0)), 2)
 
                             recommendations.append({
                                 "sport": sport_label,
@@ -99,8 +106,7 @@ def extract_live_recommendations():
                                 "pick": pick_label,
                                 "book_odds": amer_odds,
                                 "ev_percent": ev_pct,
-                                "suggested_stake": q_kelly,
-                                "fair_prob": round(fair_p, 4)
+                                "suggested_stake": q_kelly
                             })
                             break
                     if recommendations and recommendations[-1]["matchup"] == matchup:
@@ -108,7 +114,7 @@ def extract_live_recommendations():
 
     df = pd.DataFrame(recommendations)
     if not df.empty:
-        df = df.drop_duplicates(subset=["sport", "matchup", "market"]).head(6)
+        df = df.drop_duplicates(subset=["sport", "matchup", "market"]).head(8)
     return df
 
 def send_morning_slate_email(recs_df, total_stake, was_capped):
@@ -181,9 +187,9 @@ def send_morning_slate_email(recs_df, total_stake, was_capped):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
             server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        print(f"[✓] Morning slate email successfully dispatched to {RECIPIENT_EMAIL}!")
+        print(f"[✓] Slate email successfully dispatched to {RECIPIENT_EMAIL}!")
     except Exception as e:
-        print(f"[-] Failed to send morning slate email: {e}")
+        print(f"[-] Email dispatch note: {e}")
 
 def apply_portfolio_risk_governor(recs_df, max_slate_exposure=6.0):
     if recs_df.empty or "suggested_stake" not in recs_df.columns:
@@ -206,22 +212,23 @@ def run_pipeline():
     live_df = extract_live_recommendations()
 
     if live_df.empty:
-        print("[-] No edges met threshold or API returned empty slate.")
+        print("[-] Notice: No edges cleared the hurdle rate on this scan.")
         return
 
     governed_df, was_capped = apply_portfolio_risk_governor(live_df, MAX_DAILY_EXPOSURE_UNITS)
     total_slate_stake = governed_df["suggested_stake"].sum()
 
-    print("[*] Clearing yesterday's games from Supabase...")
+    print("[*] Refreshing Supabase table...")
     requests.delete(f"{SUPABASE_URL}/rest/v1/bet_recommendations?id=neq.00000000-0000-0000-0000-000000000000", headers=HEADERS, timeout=8)
 
+    # Valid database columns: sport, matchup, market, pick, book_odds, ev_percent, suggested_stake, created_at
     records = governed_df.to_dict(orient="records")
     for r in records:
         r["created_at"] = datetime.now(timezone.utc).isoformat()
 
     res = requests.post(f"{SUPABASE_URL}/rest/v1/bet_recommendations", headers=HEADERS, json=records, timeout=8)
     if res.status_code in [200, 201]:
-        print(f"[✓] Successfully committed {len(records)} plays for today to Supabase!")
+        print(f"[✓] Successfully committed {len(records)} active plays to Supabase!")
         send_morning_slate_email(governed_df, total_slate_stake, was_capped)
     else:
         print(f"[-] Supabase write error: {res.status_code} - {res.text}")
