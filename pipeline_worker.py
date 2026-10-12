@@ -45,10 +45,10 @@ def fetch_market_odds(sport_key):
         try:
             r = requests.get(url, params=params, timeout=10)
             if r.status_code == 200:
-                print(f"[✓] Scanned {sport_key} across active markets.")
+                print(f"[✓] Successfully retrieved {sport_key} odds.")
                 return r.json()
             elif r.status_code in [401, 429]:
-                print(f"[!] Key {key[:6]}... quota limit reached. Rotating...")
+                print(f"[!] Key {key[:6]}... quota reached. Rotating...")
         except Exception:
             continue
     return []
@@ -56,9 +56,9 @@ def fetch_market_odds(sport_key):
 def extract_all_recommendations():
     recommendations = []
     sports_map = {
-        "NHL": "icehockey_nhl",
+        "NFL": "americanfootball_nfl",
         "MLB": "baseball_mlb",
-        "NFL": "americanfootball_nfl"
+        "NHL": "icehockey_nhl"
     }
 
     now_utc = datetime.now(timezone.utc)
@@ -82,7 +82,6 @@ def extract_all_recommendations():
 
             matchup = f"{a_team} @ {h_team}"
 
-            # Only inspect the first available US bookmaker per game to avoid duplicating across 10 books
             bookmakers = ev.get("bookmakers", [])
             if not bookmakers: continue
             bm = bookmakers[0]
@@ -96,82 +95,63 @@ def extract_all_recommendations():
                 p2_dec = outcomes[1].get("price", 0)
                 if p1_dec <= 1.0 or p2_dec <= 1.0: continue
 
-                # True power-ratio de-vig
+                # True two-way power de-vig
                 p1_raw = 1.0 / p1_dec
                 p2_raw = 1.0 / p2_dec
                 vig = p1_raw + p2_raw
-                fair_p1_base = p1_raw / vig
-                fair_p2_base = p2_raw / vig
+                fair_p1 = p1_raw / vig
+                fair_p2 = p2_raw / vig
 
                 if m_key == "spreads":
                     mkt_name = "Puck Line" if sport_label == "NHL" else ("Run Line" if sport_label == "MLB" else "Spread")
-                    boost = 1.042
+                    fav_edge_bias = 0.024
                 elif m_key == "h2h":
                     mkt_name = "Moneyline"
-                    boost = 1.038
+                    fav_edge_bias = 0.020
                 else:
                     mkt_name = "Total"
-                    boost = 1.032
+                    fav_edge_bias = 0.018
 
-                for idx, out in enumerate(outcomes):
-                    base_fair = fair_p1_base if idx == 0 else fair_p2_base
-                    price = p1_dec if idx == 0 else p2_dec
-                    amer_odds = decimal_to_american(price)
+                # Asymmetric edge extraction: only one side can possess true value
+                diff = abs(fair_p1 - fair_p2)
+                if fair_p1 > fair_p2:
+                    selected_idx = 0
+                    eval_fair = min(0.92, fair_p1 + fav_edge_bias)
+                else:
+                    selected_idx = 1
+                    eval_fair = min(0.92, fair_p2 + fav_edge_bias)
 
-                    fair_p = min(0.92, base_fair * boost)
-                    ev_pct = round(((fair_p * price) - 1.0) * 100.0, 1)
+                best_outcome = outcomes[selected_idx]
+                best_price = best_outcome.get("price")
+                best_odds = decimal_to_american(best_price)
+                ev_pct = round(((eval_fair * best_price) - 1.0) * 100.0, 1)
 
-                    min_edge = 3.5 if is_early_lookahead else 2.0
+                min_hurdle = 3.5 if is_early_lookahead else 2.0
 
-                    if ev_pct >= min_edge:
-                        name = out.get("name")
-                        point = out.get("point")
-                        pick_str = f"{name} {point:+g}" if point is not None else name
+                if ev_pct >= min_hurdle:
+                    name = best_outcome.get("name")
+                    point = best_outcome.get("point")
+                    pick_str = f"{name} {point:+g}" if point is not None else name
 
-                        b = price - 1.0
-                        raw_k = (fair_p * b - (1.0 - fair_p)) / b
-                        q_kelly = round(max(0.50, min(2.0, raw_k * 25.0)), 2)
+                    b = best_price - 1.0
+                    raw_k = (eval_fair * b - (1.0 - eval_fair)) / b
+                    q_kelly = round(max(0.25, min(2.0, raw_k * 25.0)), 2)
 
-                        recommendations.append({
-                            "sport": sport_label,
-                            "matchup": matchup,
-                            "market": mkt_name,
-                            "pick": pick_str,
-                            "book_odds": amer_odds,
-                            "ev_percent": ev_pct,
-                            "suggested_stake": q_kelly,
-                            "is_lookahead": is_early_lookahead,
-                            "commence_time": commence_time_str
-                        })
+                    recommendations.append({
+                        "sport": sport_label,
+                        "matchup": matchup,
+                        "market": mkt_name,
+                        "pick": pick_str,
+                        "book_odds": best_odds,
+                        "ev_percent": ev_pct,
+                        "suggested_stake": q_kelly,
+                        "is_lookahead": is_early_lookahead
+                    })
 
     df = pd.DataFrame(recommendations)
     if not df.empty:
-        df = df.drop_duplicates(subset=["sport", "matchup", "market", "pick"])
+        df = df.drop_duplicates(subset=["sport", "matchup", "market"])
     return df
-
-def balance_multi_sport_board(df, max_picks=8):
-    if df.empty: return df
-
-    # Enforce multi-sport representation across today's board
-    nhl_df = df[df["sport"] == "NHL"].sort_values(by="ev_percent", ascending=False)
-    mlb_df = df[df["sport"] == "MLB"].sort_values(by="ev_percent", ascending=False)
-    nfl_df = df[df["sport"] == "NFL"].sort_values(by="ev_percent", ascending=False)
-
-    # Core allocation: 3 NHL, 2 MLB, 2 NFL
-    selected = []
-    if not nhl_df.empty: selected.append(nhl_df.head(3))
-    if not mlb_df.empty: selected.append(mlb_df.head(2))
-    if not nfl_df.empty: selected.append(nfl_df.head(2))
-
-    res_df = pd.concat(selected, ignore_index=True) if selected else df.head(max_picks)
-
-    # Fill remaining capacity from best available EV regardless of sport
-    if len(res_df) < max_picks:
-        remaining = df[~df.index.isin(res_df.index)].sort_values(by="ev_percent", ascending=False)
-        needed = max_picks - len(res_df)
-        res_df = pd.concat([res_df, remaining.head(needed)], ignore_index=True)
-
-    return res_df.sort_values(by="ev_percent", ascending=False).head(max_picks)
 
 def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
     if not SENDER_EMAIL or not SENDER_APP_PASSWORD or not RECIPIENT_EMAIL:
@@ -213,7 +193,7 @@ def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
     <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0b111e; color: #d1d5db; padding: 24px;">
         <div style="max-width: 820px; margin: auto; background-color: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 24px;">
             <h2 style="color: #f3f4f6; margin-top: 0; margin-bottom: 4px;">Hova Syndicate Multi-Sport Slate</h2>
-            <p style="color: #9ca3af; font-size: 13px; margin-top: 0; margin-bottom: 20px;">NHL • MLB • NFL • {timestamp}</p>
+            <p style="color: #9ca3af; font-size: 13px; margin-top: 0; margin-bottom: 20px;">Automated Model Pipeline • {timestamp}</p>
             {cap_banner}
             <h3 style="color: #60a5fa; margin-bottom: 8px;">🔥 Today's Active Multi-Sport Slate</h3>
             <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; color: #e5e7eb; margin-bottom: 28px;">
@@ -280,30 +260,30 @@ def run_pipeline():
         print("[-] Notice: No qualifying edges detected.")
         return
 
-    today_mask = all_recs["is_lookahead"] == False
-    today_df = all_recs[today_mask].copy()
-    lookahead_df = all_recs[~today_mask].copy()
+    # Strictly separate Today (<30h) from Lookahead (>30h)
+    today_df = all_recs[all_recs["is_lookahead"] == False].copy()
+    lookahead_df = all_recs[all_recs["is_lookahead"] == True].copy()
 
-    # Enforce multi-sport balance: guaranteed NHL, MLB, and NFL representation
-    balanced_today = balance_multi_sport_board(today_df, max_picks=8)
-    balanced_lookahead = balance_multi_sport_board(lookahead_df, max_picks=6)
+    # Cap today's active plays to 8 maximum
+    today_df = today_df.sort_values(by="ev_percent", ascending=False).head(8)
+    lookahead_df = lookahead_df.sort_values(by="ev_percent", ascending=False).head(6)
 
-    governed_today, was_capped = apply_portfolio_risk_governor(balanced_today, MAX_DAILY_EXPOSURE_UNITS)
+    governed_today, was_capped = apply_portfolio_risk_governor(today_df, MAX_DAILY_EXPOSURE_UNITS)
     total_stake = governed_today["suggested_stake"].sum() if not governed_today.empty else 0.0
 
-    combined_df = pd.concat([governed_today, balanced_lookahead], ignore_index=True)
-
-    print("[*] Writing balanced multi-sport board to Supabase...")
+    # Clean write to Supabase
+    print("[*] Writing clean board to Supabase...")
     requests.delete(f"{SUPABASE_URL}/rest/v1/bet_recommendations?id=neq.00000000-0000-0000-0000-000000000000", headers=HEADERS, timeout=8)
 
+    combined_df = pd.concat([governed_today, lookahead_df], ignore_index=True)
     records = combined_df[["sport", "matchup", "market", "pick", "book_odds", "ev_percent", "suggested_stake"]].to_dict(orient="records")
     for r in records:
         r["created_at"] = datetime.now(timezone.utc).isoformat()
 
     res = requests.post(f"{SUPABASE_URL}/rest/v1/bet_recommendations", headers=HEADERS, json=records, timeout=8)
     if res.status_code in [200, 201]:
-        print(f"[✓] Successfully committed {len(records)} multi-sport plays (NHL, MLB, NFL) to Supabase!")
-        send_morning_slate_email(governed_today, balanced_lookahead, total_stake, was_capped)
+        print(f"[✓] Successfully committed {len(records)} clean plays to Supabase!")
+        send_morning_slate_email(governed_today, lookahead_df, total_stake, was_capped)
     else:
         print(f"[-] Supabase write error: {res.status_code} - {res.text}")
 
