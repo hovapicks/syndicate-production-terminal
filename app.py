@@ -129,7 +129,8 @@ with tabs[0]:
         col_f1, col_f2 = st.columns([3, 2])
         with col_f1:
             sports_present = sorted(df_recs["sport"].unique().tolist())
-            selected_sport = st.pills("Filter by Sport", ["ALL"] + sports_present, default="ALL")
+            available_sports = ["ALL"] + [s for s in ["NHL", "MLB", "NFL", "NCAAF"] if s in sports_present or s == "NCAAF"]
+selected_sport = st.pills("Filter by Sport", available_sports, default="ALL")
         with col_f2:
             board_scope = st.segmented_control("Slate Scope", ["🔥 Today's Active Slate", "⚡ All Markets (Inc. Lookaheads)"], default="🔥 Today's Active Slate")
 
