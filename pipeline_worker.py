@@ -1,10 +1,7 @@
 ﻿import os
 import requests
-import smtplib
 import numpy as np
 import pandas as pd
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
@@ -14,11 +11,6 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "https://btzzkdjnijzzdqvjnomr.supabase.
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 MAX_DAILY_EXPOSURE_UNITS = float(os.getenv("MAX_DAILY_EXPOSURE_UNITS", "6.0"))
 
-SENDER_EMAIL = os.getenv("SENDER_EMAIL")
-SENDER_APP_PASSWORD = os.getenv("SENDER_APP_PASSWORD")
-RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "hovapicks@gmail.com")
-
-# Dynamic Key Discovery across the full pool
 ODDS_API_KEYS = [
     val for k, val in sorted(os.environ.items(), key=lambda x: int(x[0].split('_')[-1]) if x[0].split('_')[-1].isdigit() else 99)
     if k.startswith("ODDS_API_KEY_") and val
@@ -38,9 +30,10 @@ def decimal_to_american(dec):
     if dec <= 1.0: return -110
     return int(round((dec - 1.0) * 100)) if dec >= 2.0 else int(round(-100 / (dec - 1.0)))
 
-def fetch_market_odds(sport_key):
+def fetch_market_odds(sport_key, sport_label):
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
-    params = {"regions": "us", "markets": "h2h,spreads,totals", "oddsFormat": "decimal"}
+    regions = "us,uk" if sport_label == "EPL" else "us"
+    params = {"regions": regions, "markets": "h2h,spreads,totals", "oddsFormat": "decimal"}
 
     for key in ODDS_API_KEYS:
         if not key: continue
@@ -63,14 +56,15 @@ def extract_all_recommendations():
         "NHL": "icehockey_nhl",
         "MLB": "baseball_mlb",
         "NFL": "americanfootball_nfl",
-        "NCAAF": "americanfootball_ncaaf"
+        "NCAAF": "americanfootball_ncaaf",
+        "EPL": "soccer_epl"
     }
 
     now_utc = datetime.now(timezone.utc)
     cutoff_30h = now_utc + timedelta(hours=30)
 
     for sport_label, sport_key in sports_map.items():
-        events = fetch_market_odds(sport_key)
+        events = fetch_market_odds(sport_key, sport_label)
         for ev in events:
             h_team = ev.get("home_team")
             a_team = ev.get("away_team")
@@ -87,7 +81,7 @@ def extract_all_recommendations():
             else:
                 is_early_lookahead = False
 
-            matchup = f"{a_team} @ {h_team}"
+            matchup = f"{a_team} @ {h_team}" if sport_label != "EPL" else f"{h_team} vs {a_team}"
             market_buckets = {"h2h": {}, "spreads": {}, "totals": {}}
 
             for bm in ev.get("bookmakers", []):
@@ -95,25 +89,23 @@ def extract_all_recommendations():
                     m_key = mkt.get("key")
                     if m_key not in market_buckets: continue
                     outcomes = mkt.get("outcomes", [])
-                    if len(outcomes) != 2: continue
+                    
+                    # Strictly 2-way for US sports; 3-way only for EPL
+                    expected_count = [2, 3] if sport_label == "EPL" else [2]
+                    if len(outcomes) not in expected_count: continue
 
-                    p1_dec = outcomes[0].get("price", 0)
-                    p2_dec = outcomes[1].get("price", 0)
-                    if p1_dec <= 1.0 or p2_dec <= 1.0: continue
+                    prices = [o.get("price", 0) for o in outcomes]
+                    if any(p <= 1.0 for p in prices): continue
 
-                    vig = (1.0 / p1_dec) + (1.0 / p2_dec)
-                    p1_fair = (1.0 / p1_dec) / vig
-                    p2_fair = (1.0 / p2_dec) / vig
+                    vig = sum(1.0 / p for p in prices)
 
-                    o1, o2 = outcomes[0], outcomes[1]
-                    k1 = (o1.get("name"), o1.get("point"))
-                    k2 = (o2.get("name"), o2.get("point"))
-
-                    if k1 not in market_buckets[m_key]: market_buckets[m_key][k1] = []
-                    if k2 not in market_buckets[m_key]: market_buckets[m_key][k2] = []
-
-                    market_buckets[m_key][k1].append({"price": p1_dec, "fair": p1_fair})
-                    market_buckets[m_key][k2].append({"price": p2_dec, "fair": p2_fair})
+                    for o in outcomes:
+                        p_dec = o.get("price", 0)
+                        p_fair = (1.0 / p_dec) / vig
+                        k = (o.get("name"), o.get("point"))
+                        if k not in market_buckets[m_key]:
+                            market_buckets[m_key][k] = []
+                        market_buckets[m_key][k].append({"price": p_dec, "fair": p_fair})
 
             game_side_candidates = []
             game_total_candidates = []
@@ -122,21 +114,20 @@ def extract_all_recommendations():
                 if not outcome_dict: continue
 
                 if m_key == "spreads":
-                    mkt_name = "Puck Line" if sport_label == "NHL" else ("Run Line" if sport_label == "MLB" else "Spread")
+                    mkt_name = "Puck Line" if sport_label == "NHL" else ("Run Line" if sport_label == "MLB" else ("Goal Line" if sport_label == "EPL" else "Spread"))
                 elif m_key == "h2h":
-                    mkt_name = "Moneyline"
+                    mkt_name = "Match Result" if sport_label == "EPL" else "Moneyline"
                 else:
                     mkt_name = "Total"
 
                 for (name, point), quotes in outcome_dict.items():
-                    if not quotes: continue
+                    if len(quotes) < 2: continue
                     best_quote = max(quotes, key=lambda q: q["price"])
                     avg_fair = np.mean([q["fair"] for q in quotes])
                     
                     price = best_quote["price"]
                     edge_boost = 1.035
                     
-                    # CFB Key Number Push Equity Bonus
                     if sport_label == "NCAAF" and point is not None:
                         abs_pt = abs(float(point))
                         if mkt_name == "Spread" and abs_pt in CFB_SPREAD_KEYS:
@@ -147,7 +138,8 @@ def extract_all_recommendations():
                     fair_p = min(0.92, avg_fair * edge_boost)
                     ev_pct = round(((fair_p * price) - 1.0) * 100.0, 1)
 
-                    if ev_pct >= 1.5:
+                    # Strict filter to drop synthetic regulation lines and noise
+                    if 1.5 <= ev_pct <= 18.0:
                         pick_str = f"{name} {point:+g}" if point is not None else name
                         amer_odds = decimal_to_american(price)
                         b = price - 1.0
@@ -210,12 +202,14 @@ def balance_multi_sport_board(df, max_picks=8):
     mlb_df = df[df["sport"] == "MLB"].sort_values(by="ev_percent", ascending=False)
     nfl_df = df[df["sport"] == "NFL"].sort_values(by="ev_percent", ascending=False)
     cfb_df = df[df["sport"] == "NCAAF"].sort_values(by="ev_percent", ascending=False)
+    epl_df = df[df["sport"] == "EPL"].sort_values(by="ev_percent", ascending=False)
 
     selected = []
-    if not nhl_df.empty: selected.append(nhl_df.head(3))
-    if not mlb_df.empty: selected.append(mlb_df.head(3))
+    if not nhl_df.empty: selected.append(nhl_df.head(2))
+    if not mlb_df.empty: selected.append(mlb_df.head(2))
     if not nfl_df.empty: selected.append(nfl_df.head(2))
     if not cfb_df.empty: selected.append(cfb_df.head(2))
+    if not epl_df.empty: selected.append(epl_df.head(2))
 
     res_df = pd.concat(selected, ignore_index=True) if selected else df.head(max_picks)
 
@@ -243,11 +237,11 @@ def apply_portfolio_risk_governor(recs_df, max_slate_exposure=6.0):
     return recs_df, was_capped
 
 def run_pipeline():
-    print("[*] Ingesting multi-sport slate (NHL, MLB, NFL, NCAAF)...")
+    print("[*] Ingesting multi-sport slate with strict 2-way OT and isolated EPL regions...")
     all_recs = extract_all_recommendations()
 
     if all_recs.empty:
-        print("[-] Notice: No qualifying edges detected for unstarted games.")
+        print("[-] Notice: No qualifying edges detected.")
         return
 
     today_mask = all_recs["is_lookahead"] == False
@@ -255,11 +249,11 @@ def run_pipeline():
     lookahead_df = all_recs[~today_mask].copy()
 
     balanced_today = balance_multi_sport_board(today_df, max_picks=8)
-    balanced_lookahead = balance_multi_sport_board(lookahead_df, max_picks=6)
+    balanced_lookahead = balance_multi_sport_board(lookahead_df, max_picks=8)
 
     governed_today, was_capped = apply_portfolio_risk_governor(balanced_today, MAX_DAILY_EXPOSURE_UNITS)
 
-    print("[*] Writing cleaned board to Supabase...")
+    print("[*] Purging old entries in Supabase bet_recommendations table...")
     requests.delete(f"{SUPABASE_URL}/rest/v1/bet_recommendations?id=neq.00000000-0000-0000-0000-000000000000", headers=HEADERS, timeout=8)
 
     combined_df = pd.concat([governed_today, balanced_lookahead], ignore_index=True)
