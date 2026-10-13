@@ -4,256 +4,208 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-from settlement_engine import run_settlement
-from pipeline_worker import run_pipeline
 
 load_dotenv()
 
-st.set_page_config(page_title="Syndicate Production Terminal", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(
+    page_title="Syndicate Production Terminal",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
+# Dark theme styling
 st.markdown("""
 <style>
-    .stApp { background-color: #0b111e; color: #d1d5db; }
-    div[data-testid="stMetricValue"] { color: #f3f4f6; }
-    .badge-sport {
-        display: inline-block;
-        padding: 2px 8px;
-        border-radius: 4px;
-        font-weight: 700;
-        font-size: 11px;
-        background: #1f2937;
-        color: #93c5fd;
-        margin-right: 8px;
+    .stApp {
+        background-color: #0b0f19;
+        color: #f3f4f6;
     }
-    .badge-edge { color: #10b981; font-weight: 700; font-size: 13px; }
+    div[data-testid="stMetricValue"] {
+        font-size: 1.6rem !important;
+        font-weight: 700 !important;
+        color: #38bdf8 !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://btzzkdjnijzzdqvjnomr.supabase.co").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-BOOKMAKERS = [
-    "DraftKings", "FanDuel", "BetMGM", "Caesars", "bet365",
-    "theScore", "Bally Bet", "Fanatics", "BetOnline", "Novig",
-    "Circa", "Pinnacle", "Other"
-]
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "return=representation"
+    "Content-Type": "application/json"
 }
 
-def send_telegram_alert(sport, matchup, market, pick, odds, stake, ev="MANUAL"):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
-    ev_display = f"+{ev}%" if ev != "MANUAL" else "MANUAL / OFF-MODEL"
-    text = (
-        f"🚨 *HOVA SYNDICATE PLAY LOCKED*\n\n"
-        f"🏆 *Sport:* {sport}\n"
-        f"⚔️ *Matchup:* {matchup}\n"
-        f"🎯 *Market:* {market}\n"
-        f"⚡ *Pick:* {pick}\n"
-        f"📈 *Book Odds:* {odds:+d}\n"
-        f"💰 *Stake:* {stake}u\n"
-        f"💎 *EV:* {ev_display}\n\n"
-        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-    )
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=5)
-    except Exception:
-        pass
+# Dynamically collect all available keys
+ODDS_API_KEYS = [
+    val for k, val in sorted(os.environ.items(), key=lambda x: int(x[0].split('_')[-1]) if x[0].split('_')[-1].isdigit() else 99)
+    if k.startswith("ODDS_API_KEY_") and val
+]
+
+@st.cache_data(ttl=60)
+def fetch_api_pool_status():
+    total_remaining = 0
+    active_count = 0
+    for key in ODDS_API_KEYS:
+        if not key:
+            continue
+        try:
+            r = requests.get(f"https://api.the-odds-api.com/v4/sports/?apiKey={key}", timeout=4)
+            if r.status_code == 200:
+                rem = r.headers.get("x-requests-remaining")
+                if rem and rem.isdigit():
+                    total_remaining += int(rem)
+                    active_count += 1
+        except Exception:
+            continue
+    return total_remaining, active_count
 
 def fetch_table(table_name):
     try:
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/{table_name}?select=*", headers=HEADERS, timeout=8)
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/{table_name}?select=*&order=created_at.desc", headers=HEADERS, timeout=6)
         if r.status_code == 200:
             return pd.DataFrame(r.json())
-    except Exception:
-        pass
+    except Exception as e:
+        st.error(f"Error connecting to Supabase: {e}")
     return pd.DataFrame()
 
-def record_wager(row_data, booked_odds, booked_units, bookmaker, calculated_ev="MANUAL"):
-    payload = {
-        "sport": str(row_data["sport"]),
-        "matchup": str(row_data["matchup"]),
-        "market": str(row_data["market"]),
-        "pick": str(row_data["pick"]),
-        "odds": int(booked_odds),
-        "stake_units": float(booked_units),
-        "bookmaker": str(bookmaker),
-        "status": "OPEN",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    try:
-        r = requests.post(f"{SUPABASE_URL}/rest/v1/ledger_entries", headers=HEADERS, json=payload, timeout=8)
-        if r.status_code in [200, 201]:
-            send_telegram_alert(
-                row_data["sport"], row_data["matchup"], row_data["market"],
-                row_data["pick"], booked_odds, booked_units, calculated_ev
-            )
-            return True, "Success"
-        else:
-            return False, f"HTTP {r.status_code}: {r.text}"
-    except Exception as e:
-        return False, str(e)
+# Header Section
+col_title, col_btn = st.columns([4, 1])
+with col_title:
+    st.title("Syndicate Production Terminal")
+    st.caption("Quantitative Multi-Sport Desk • Quarter-Kelly Sizing • Autonomous Cloud Pipeline")
 
-st.markdown("<h2 style='margin-bottom:0;'>Syndicate Production Terminal</h2>", unsafe_allow_html=True)
-st.caption("Quantitative Multi-Sport Desk • Quarter-Kelly Sizing • Autonomous Cloud Pipeline")
+with col_btn:
+    if st.button("🔄 Sync Live Slate", use_container_width=True, type="primary"):
+        st.cache_data.clear()
+        st.rerun()
 
-tabs = st.tabs(["Active Model Recommendations", "Execution Ledger", "CLV & Settlement Audit"])
+# Top Metrics Row
+pool_remaining, active_keys = fetch_api_pool_status()
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("API Pool Runway", f"{pool_remaining} reqs", f"{active_keys} Active Keys")
 
-# ==============================================================================
-# TAB 1: RECOMMENDATIONS (WITH TIMING SEGMENTATION)
-# ==============================================================================
-with tabs[0]:
-    col_t1, col_t2 = st.columns([4, 1.2])
-    with col_t1:
-        st.subheader("Daily Model Edge Recommendations")
-    with col_t2:
-        if st.button("🔄 Sync Live Slate", use_container_width=True, type="primary"):
-            with st.spinner("Executing fresh model sweep across active books..."):
-                run_pipeline()
-                st.success("Slate refreshed!")
-                st.rerun()
+tab_recs, tab_ledger, tab_audit = st.tabs([
+    "Active Model Recommendations",
+    "Execution Ledger",
+    "CLV & Settlement Audit"
+])
 
+# TAB 1: RECOMMENDATIONS
+with tab_recs:
+    st.subheader("Daily Model Edge Recommendations")
     df_recs = fetch_table("bet_recommendations")
 
-    if not df_recs.empty:
-        # Drop duplicates on ingestion
-        df_recs = df_recs.drop_duplicates(subset=["matchup", "market", "pick"])
+    if df_recs.empty:
+        st.info("No active recommendations currently staged. Run pipeline_worker.py to sweep the board.")
+    else:
+        sports_in_data = sorted(df_recs["sport"].dropna().unique().tolist())
+        pill_options = ["ALL"] + [s for s in ["NHL", "MLB", "NFL", "NCAAF"] if s in sports_in_data or s == "NCAAF"]
 
         col_f1, col_f2 = st.columns([3, 2])
         with col_f1:
-            sports_present = sorted(df_recs["sport"].unique().tolist())
-            available_sports = ["ALL"] + [s for s in ["NHL", "MLB", "NFL", "NCAAF"] if s in sports_present or s == "NCAAF"]
-selected_sport = st.pills("Filter by Sport", available_sports, default="ALL")
+            selected_sport = st.pills("Filter by Sport", pill_options, default="ALL")
         with col_f2:
-            board_scope = st.segmented_control("Slate Scope", ["🔥 Today's Active Slate", "⚡ All Markets (Inc. Lookaheads)"], default="🔥 Today's Active Slate")
+            slate_scope = st.segmented_control(
+                "Slate Scope",
+                ["🔥 Today's Active Slate", "⚡ All Markets (Inc. Lookaheads)"],
+                default="🔥 Today's Active Slate"
+            )
 
-        view_df = df_recs if selected_sport == "ALL" else df_recs[df_recs["sport"] == selected_sport]
+        # Filter by Scope
+        if "is_lookahead" in df_recs.columns and slate_scope == "🔥 Today's Active Slate":
+            filtered_df = df_recs[df_recs["is_lookahead"] == False].copy()
+        else:
+            filtered_df = df_recs.copy()
 
-        # Filter out distant games from today's active view
-        if board_scope == "🔥 Today's Active Slate":
-            lookahead_keywords = ["Commanders", "Patriots", "Chiefs", "Cardinals"]
-            view_df = view_df[~view_df["matchup"].str.contains("|".join(lookahead_keywords))]
+        # Filter by Sport
+        if selected_sport != "ALL":
+            filtered_df = filtered_df[filtered_df["sport"] == selected_sport]
 
-        if "staged_pick" not in st.session_state:
-            st.session_state.staged_pick = None
+        if filtered_df.empty:
+            st.info("No qualified edges found for this sport/slate selection.")
+        else:
+            for idx, row in filtered_df.iterrows():
+                with st.container(border=True):
+                    c_badge, c_matchup, c_pick, c_odds, c_ev, c_stake, c_action = st.columns([1, 4, 3, 2, 2, 2, 2])
+                    c_badge.markdown(f"**`{row.get('sport')}`**")
+                    c_matchup.markdown(f"**{row.get('matchup')}**")
+                    c_pick.markdown(f"{row.get('pick')} ({row.get('market')})")
+                    
+                    o_val = row.get("book_odds")
+                    o_str = f"+{o_val}" if o_val > 0 else str(o_val)
+                    c_odds.markdown(f"Odds: **{o_str}**")
+                    
+                    ev_val = float(row.get("ev_percent", 0.0))
+                    c_ev.markdown(f":green[**+{ev_val:.1f}%**]")
+                    
+                    c_stake.markdown(f"Rec: **{row.get('suggested_stake')}u**")
+                    
+                    lock_btn = c_action.button("⚡ Lock", key=f"lock_{row.get('id', idx)}", use_container_width=True)
+                    if lock_btn:
+                        st.session_state["staging_row"] = row.to_dict()
 
-        if st.session_state.staged_pick:
-            stg = st.session_state.staged_pick
-            with st.container():
-                st.markdown(f"""
-                <div style="background: rgba(37, 99, 235, 0.12); border: 1px solid #2563eb; border-radius: 6px; padding: 14px 18px; margin-bottom: 20px;">
-                    <div style="font-weight: 700; color: #93c5fd; font-size: 14px; margin-bottom: 4px;">
-                        ⚡ CONFIRM & STAGE WAGER: {stg['sport']} • {stg['matchup']} • {stg['pick']}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                col_b1, col_b2, col_b3, col_b4, col_b5 = st.columns([2, 2, 2, 2, 1.5])
-                with col_b1:
-                    b_odds = st.number_input("Book Odds (American)", value=int(stg["book_odds"]), step=1, key="stage_odds")
-                with col_b2:
-                    b_stake = st.number_input("Stake Units", value=float(stg["suggested_stake"]), min_value=0.25, step=0.25, key="stage_stake")
-                with col_b3:
-                    book_name = st.selectbox("Bookmaker", BOOKMAKERS, key="stage_book")
-                with col_b4:
-                    if st.button("✅ Commit to Ledger", use_container_width=True, type="primary"):
-                        success, msg = record_wager(stg, b_odds, b_stake, book_name, stg.get("ev_percent", "MANUAL"))
-                        if success:
-                            st.success(f"Locked {stg['pick']} ({b_stake}u) to Ledger & dispatched alert!")
-                            st.session_state.staged_pick = None
-                            st.rerun()
-                        else:
-                            st.error(f"Commit Failed: {msg}")
-                with col_b5:
-                    if st.button("✖ Cancel", use_container_width=True):
-                        st.session_state.staged_pick = None
+            if "staging_row" in st.session_state:
+                st.divider()
+                st.write("### Stage Pick to Ledger")
+                st_data = st.session_state["staging_row"]
+                col_in1, col_in2, col_in3 = st.columns(3)
+                bm = col_in1.selectbox("Bookmaker", ["DraftKings", "FanDuel", "BetMGM", "Caesars", "Pinnacle", "Circa"])
+                stk = col_in2.number_input("Confirmed Units", value=float(st_data.get("suggested_stake", 1.0)), step=0.1)
+                commit_btn = col_in3.button("✅ Commit to Ledger", type="primary", use_container_width=True)
+                
+                if commit_btn:
+                    payload = {
+                        "sport": str(st_data["sport"]),
+                        "matchup": str(st_data["matchup"]),
+                        "market": str(st_data["market"]),
+                        "pick": str(st_data["pick"]),
+                        "odds": int(st_data["book_odds"]),
+                        "stake_units": float(stk),
+                        "bookmaker": str(bm),
+                        "status": "OPEN",
+                        "created_at": datetime.now(timezone.utc).isoformat()
+                    }
+                    pres = requests.post(f"{SUPABASE_URL}/rest/v1/ledger_entries", headers=HEADERS, json=payload)
+                    if pres.status_code in [200, 201]:
+                        st.success(f"Position locked into ledger: {payload['pick']}")
+                        del st.session_state["staging_row"]
+                        st.cache_data.clear()
                         st.rerun()
 
-        for idx, row in view_df.iterrows():
-            c1, c2, c3, c4, c5, c6, c7 = st.columns([1.2, 2.5, 2.2, 1.3, 1.3, 1.4, 1.5])
-            with c1:
-                st.markdown(f"<span class='badge-sport'>{row['sport']}</span>", unsafe_allow_html=True)
-            with c2:
-                st.write(f"**{row['matchup']}**")
-            with c3:
-                st.write(f"{row['pick']} ({row['market']})")
-            with c4:
-                st.write(f"Odds: **{row['book_odds']}**")
-            with c5:
-                st.markdown(f"<span class='badge-edge'>+{row['ev_percent']}%</span>", unsafe_allow_html=True)
-            with c6:
-                st.write(f"Rec: **{row['suggested_stake']}u**")
-            with c7:
-                if st.button("⚡ Lock", key=f"btn_lock_{idx}", use_container_width=True):
-                    st.session_state.staged_pick = row.to_dict()
-                    st.rerun()
-            st.divider()
-
-    else:
-        st.info("No active edge recommendations in database. Hit Sync Live Slate above.")
-
-# TAB 2: EXECUTION LEDGER
-with tabs[1]:
-    st.subheader("Locked Positions Ledger")
+# TAB 2: LEDGER
+with tab_ledger:
+    st.subheader("Active & Historical Ledger Entries")
     df_ledger = fetch_table("ledger_entries")
-    if not df_ledger.empty:
-        df_ledger = df_ledger.sort_values(by="created_at", ascending=False)
-        display_cols = ["created_at", "sport", "matchup", "market", "pick", "odds", "stake_units", "bookmaker", "status"]
-        if "net_units" in df_ledger.columns: display_cols.append("net_units")
-        if "result_score" in df_ledger.columns: display_cols.append("result_score")
-        st.dataframe(df_ledger[display_cols], use_container_width=True, hide_index=True)
+    if df_ledger.empty:
+        st.info("No recorded ledger entries found.")
     else:
-        st.info("No wagers locked in the ledger yet.")
+        st.dataframe(
+            df_ledger[["sport", "matchup", "pick", "odds", "stake_units", "bookmaker", "status", "created_at"]],
+            use_container_width=True,
+            hide_index=True
+        )
 
-# TAB 3: CLV & SETTLEMENT AUDIT
-with tabs[2]:
-    col_s1, col_s2 = st.columns([4, 1])
-    with col_s1:
-        st.subheader("Closing Line Value & Performance Audit")
-    with col_s2:
-        if st.button("⚡ Audit & Settle", use_container_width=True, type="primary"):
-            with st.spinner("Checking ESPN scores & settling tickets..."):
-                run_settlement()
-                st.success("Reconciliation complete!")
-                st.rerun()
-
-    df_ledger = fetch_table("ledger_entries")
-    if not df_ledger.empty:
-        settled_mask = df_ledger["status"].isin(["WON", "LOST", "PUSH"])
-        df_settled = df_ledger[settled_mask]
-        net_profit = df_settled["net_units"].astype(float).sum() if "net_units" in df_settled.columns else 0.0
-        total_risk = df_settled["stake_units"].astype(float).sum()
-        roi_pct = (net_profit / total_risk * 100.0) if total_risk > 0 else 0.0
-
-        wins = len(df_ledger[df_ledger["status"] == "WON"])
-        losses = len(df_ledger[df_ledger["status"] == "LOST"])
-        pushes = len(df_ledger[df_ledger["status"] == "PUSH"])
-        open_bets = len(df_ledger[df_ledger["status"] == "OPEN"])
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Cumulative Net P&L", f"{net_profit:+.2f}u", delta=f"{roi_pct:+.1f}% ROI")
-        m2.metric("Graded Record", f"{wins}W - {losses}L - {pushes}P", f"{open_bets} Pending")
-        m3.metric("Total Volume Wagered", f"{df_ledger['stake_units'].astype(float).sum():.2f}u")
-        
-        if "clv_percent" in df_ledger.columns and not df_ledger["clv_percent"].dropna().empty:
-            avg_clv = df_ledger["clv_percent"].astype(float).mean()
-            m4.metric("Consensus CLV Edge", f"{avg_clv:+.2f}%")
+# TAB 3: SETTLEMENT AUDIT
+with tab_audit:
+    st.subheader("Settlement Grading & Cumulative Metrics")
+    df_settled = fetch_table("ledger_entries")
+    if not df_settled.empty and "status" in df_settled.columns:
+        closed = df_settled[df_settled["status"].isin(["WON", "LOST", "PUSH"])]
+        if not closed.empty and "net_units" in closed.columns:
+            tot_pnl = closed["net_units"].fillna(0).astype(float).sum()
+            tot_wagered = closed["stake_units"].fillna(0).astype(float).sum()
+            roi = (tot_pnl / tot_wagered * 100.0) if tot_wagered > 0 else 0.0
+            
+            c_pnl, c_roi, c_closed = st.columns(3)
+            c_pnl.metric("Realized P&L", f"{tot_pnl:+.2f}u")
+            c_roi.metric("Realized ROI", f"{roi:+.1f}%")
+            c_closed.metric("Settled Plays", len(closed))
+            
+            st.dataframe(closed[["sport", "matchup", "pick", "odds", "stake_units", "status", "net_units", "result_score"]], use_container_width=True, hide_index=True)
         else:
-            m4.metric("Consensus CLV Edge", "--")
-
-        st.divider()
-        st.markdown("#### Audited Position History")
-        audit_cols = ["sport", "matchup", "pick", "odds", "stake_units", "status"]
-        if "net_units" in df_ledger.columns: audit_cols.append("net_units")
-        if "result_score" in df_ledger.columns: audit_cols.append("result_score")
-        if "clv_percent" in df_ledger.columns: audit_cols.append("clv_percent")
-        st.dataframe(df_ledger[audit_cols], use_container_width=True, hide_index=True)
+            st.info("Pending settlement audit. All ledger rows currently OPEN.")
     else:
-        st.info("No wagers locked in the ledger yet.")
+        st.info("No ledger entries to audit.")
