@@ -18,11 +18,10 @@ SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 SENDER_APP_PASSWORD = os.getenv("SENDER_APP_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "hovapicks@gmail.com")
 
+# Dynamic Key Discovery across the full pool
 ODDS_API_KEYS = [
-    os.getenv("ODDS_API_KEY_1", "b57a9742abb4c32ac9bd245ea8ca47ff"),
-    os.getenv("ODDS_API_KEY_2", "6c404361bcf2dcf77c92b9b0598674c6"),
-    os.getenv("ODDS_API_KEY_3", "9137cefef71eb58610901407cf582c8b"),
-    os.getenv("ODDS_API_KEY_4", "0546f5420442d0179ff437806ddd3b6d")
+    val for k, val in sorted(os.environ.items(), key=lambda x: int(x[0].split('_')[-1]) if x[0].split('_')[-1].isdigit() else 99)
+    if k.startswith("ODDS_API_KEY_") and val
 ]
 
 HEADERS = {
@@ -31,6 +30,9 @@ HEADERS = {
     "Content-Type": "application/json",
     "Prefer": "return=representation"
 }
+
+CFB_SPREAD_KEYS = {3.0, 7.0, 10.0, 14.0}
+CFB_TOTAL_KEYS = {41.0, 44.0, 47.0, 51.0}
 
 def decimal_to_american(dec):
     if dec <= 1.0: return -110
@@ -50,7 +52,7 @@ def fetch_market_odds(sport_key):
                 print(f"[✓] Retrieved {sport_key} ({len(data)} events)")
                 return data
             elif r.status_code in [401, 429]:
-                print(f"[!] Rotating key {key[:6]}...")
+                continue
         except Exception:
             continue
     return []
@@ -60,7 +62,8 @@ def extract_all_recommendations():
     sports_map = {
         "NHL": "icehockey_nhl",
         "MLB": "baseball_mlb",
-        "NFL": "americanfootball_nfl"
+        "NFL": "americanfootball_nfl",
+        "NCAAF": "americanfootball_ncaaf"
     }
 
     now_utc = datetime.now(timezone.utc)
@@ -73,12 +76,11 @@ def extract_all_recommendations():
             a_team = ev.get("away_team")
             commence_time_str = ev.get("commence_time")
 
-            # Ignore any game that has already commenced or tipped off
             if commence_time_str:
                 try:
                     c_dt = datetime.fromisoformat(commence_time_str.replace("Z", "+00:00"))
                     if c_dt <= now_utc:
-                        continue  # Skip live or finished games
+                        continue
                     is_early_lookahead = (c_dt > cutoff_30h)
                 except Exception:
                     is_early_lookahead = False
@@ -86,7 +88,6 @@ def extract_all_recommendations():
                 is_early_lookahead = False
 
             matchup = f"{a_team} @ {h_team}"
-
             market_buckets = {"h2h": {}, "spreads": {}, "totals": {}}
 
             for bm in ev.get("bookmakers", []):
@@ -104,8 +105,7 @@ def extract_all_recommendations():
                     p1_fair = (1.0 / p1_dec) / vig
                     p2_fair = (1.0 / p2_dec) / vig
 
-                    o1 = outcomes[0]
-                    o2 = outcomes[1]
+                    o1, o2 = outcomes[0], outcomes[1]
                     k1 = (o1.get("name"), o1.get("point"))
                     k2 = (o2.get("name"), o2.get("point"))
 
@@ -134,7 +134,17 @@ def extract_all_recommendations():
                     avg_fair = np.mean([q["fair"] for q in quotes])
                     
                     price = best_quote["price"]
-                    fair_p = min(0.92, avg_fair * 1.035)
+                    edge_boost = 1.035
+                    
+                    # CFB Key Number Push Equity Bonus
+                    if sport_label == "NCAAF" and point is not None:
+                        abs_pt = abs(float(point))
+                        if mkt_name == "Spread" and abs_pt in CFB_SPREAD_KEYS:
+                            edge_boost = 1.045
+                        elif mkt_name == "Total" and abs_pt in CFB_TOTAL_KEYS:
+                            edge_boost = 1.042
+
+                    fair_p = min(0.92, avg_fair * edge_boost)
                     ev_pct = round(((fair_p * price) - 1.0) * 100.0, 1)
 
                     if ev_pct >= 1.5:
@@ -142,7 +152,9 @@ def extract_all_recommendations():
                         amer_odds = decimal_to_american(price)
                         b = price - 1.0
                         raw_k = (fair_p * b - (1.0 - fair_p)) / b
-                        q_kelly = round(max(0.25, min(2.0, raw_k * 25.0)), 2)
+                        
+                        max_stake_cap = 3.5 if sport_label == "NCAAF" else 2.0
+                        q_kelly = round(max(0.25, min(max_stake_cap, raw_k * 25.0)), 2)
 
                         item = {
                             "sport": sport_label,
@@ -171,16 +183,12 @@ def extract_all_recommendations():
                 game_total_candidates.sort(key=lambda x: x["ev_percent"], reverse=True)
                 recommendations.append(game_total_candidates[0])
 
-    df = pd.DataFrame(recommendations)
-    return df
+    return pd.DataFrame(recommendations)
 
 def filter_unique_teams(df):
-    """Ensures each team appears at most once across the actionable slate."""
     if df.empty: return df
     seen_teams = set()
     unique_rows = []
-
-    # Prioritize highest EV first
     df = df.sort_values(by="ev_percent", ascending=False)
 
     for _, row in df.iterrows():
@@ -196,17 +204,18 @@ def filter_unique_teams(df):
 
 def balance_multi_sport_board(df, max_picks=8):
     if df.empty: return df
-
     df = filter_unique_teams(df)
 
     nhl_df = df[df["sport"] == "NHL"].sort_values(by="ev_percent", ascending=False)
     mlb_df = df[df["sport"] == "MLB"].sort_values(by="ev_percent", ascending=False)
     nfl_df = df[df["sport"] == "NFL"].sort_values(by="ev_percent", ascending=False)
+    cfb_df = df[df["sport"] == "NCAAF"].sort_values(by="ev_percent", ascending=False)
 
     selected = []
     if not nhl_df.empty: selected.append(nhl_df.head(3))
     if not mlb_df.empty: selected.append(mlb_df.head(3))
     if not nfl_df.empty: selected.append(nfl_df.head(2))
+    if not cfb_df.empty: selected.append(cfb_df.head(2))
 
     res_df = pd.concat(selected, ignore_index=True) if selected else df.head(max_picks)
 
@@ -216,89 +225,6 @@ def balance_multi_sport_board(df, max_picks=8):
         res_df = pd.concat([res_df, remaining.head(needed)], ignore_index=True)
 
     return res_df.sort_values(by="ev_percent", ascending=False).drop_duplicates(subset=["matchup", "market", "pick"]).head(max_picks)
-
-def send_morning_slate_email(today_df, lookahead_df, total_stake, was_capped):
-    if not SENDER_EMAIL or not SENDER_APP_PASSWORD or not RECIPIENT_EMAIL:
-        return
-
-    timestamp = datetime.now(timezone.utc).strftime("%A, %B %d, %Y @ %H:%M UTC")
-    subject = f"Hova Syndicate Multi-Sport Slate — {datetime.now(timezone.utc).strftime('%b %d, %Y')}"
-
-    def build_table_rows(df):
-        rows = ""
-        for _, row in df.iterrows():
-            rows += f"""
-            <tr style="border-bottom: 1px solid #1f2937;">
-                <td style="padding: 10px; font-weight: bold; color: #93c5fd;">{row['sport']}</td>
-                <td style="padding: 10px;">{row['matchup']}</td>
-                <td style="padding: 10px;"><b>{row['pick']}</b> ({row['market']})</td>
-                <td style="padding: 10px;">{row['book_odds']}</td>
-                <td style="padding: 10px; color: #10b981; font-weight: bold;">+{row['ev_percent']}%</td>
-                <td style="padding: 10px; font-weight: bold; color: #f59e0b;">{row['suggested_stake']}u</td>
-            </tr>
-            """
-        return rows
-
-    today_rows = build_table_rows(today_df) if not today_df.empty else "<tr><td colspan='6' style='padding:12px; color:#9ca3af;'>No immediate edges within 30 hours.</td></tr>"
-    lookahead_rows = build_table_rows(lookahead_df) if not lookahead_df.empty else "<tr><td colspan='6' style='padding:12px; color:#9ca3af;'>No mispriced early openers detected.</td></tr>"
-
-    cap_banner = ""
-    if was_capped:
-        cap_banner = f"""
-        <div style="background-color: #451a03; border-left: 4px solid #f59e0b; padding: 10px 14px; margin-bottom: 20px; color: #fde68a;">
-            <b>Portfolio VaR Cap Active:</b> Slate raw allocation exceeded {MAX_DAILY_EXPOSURE_UNITS:.1f}u. Stakes scaled proportionally.
-        </div>
-        """
-
-    html_content = f"""
-    <!DOCTYPE html>
-    <html>
-    <head><meta charset="utf-8"></head>
-    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0b111e; color: #d1d5db; padding: 24px;">
-        <div style="max-width: 820px; margin: auto; background-color: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 24px;">
-            <h2 style="color: #f3f4f6; margin-top: 0; margin-bottom: 4px;">Hova Syndicate Multi-Sport Slate</h2>
-            <p style="color: #9ca3af; font-size: 13px; margin-top: 0; margin-bottom: 20px;">Automated Model Pipeline • {timestamp}</p>
-            {cap_banner}
-            <h3 style="color: #60a5fa; margin-bottom: 8px;">🔥 Today's Active Slate</h3>
-            <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; color: #e5e7eb; margin-bottom: 28px;">
-                <thead>
-                    <tr style="background-color: #1f2937; color: #9ca3af; text-transform: uppercase; font-size: 11px;">
-                        <th style="padding: 10px;">Sport</th><th style="padding: 10px;">Matchup</th><th style="padding: 10px;">Pick</th><th style="padding: 10px;">Odds</th><th style="padding: 10px;">EV %</th><th style="padding: 10px;">Staking</th>
-                    </tr>
-                </thead>
-                <tbody>{today_rows}</tbody>
-            </table>
-            <h3 style="color: #f59e0b; margin-bottom: 8px;">⚡ Mispriced Lookahead Openers</h3>
-            <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; color: #e5e7eb;">
-                <thead>
-                    <tr style="background-color: #1f2937; color: #9ca3af; text-transform: uppercase; font-size: 11px;">
-                        <th style="padding: 10px;">Sport</th><th style="padding: 10px;">Matchup</th><th style="padding: 10px;">Pick</th><th style="padding: 10px;">Odds</th><th style="padding: 10px;">EV %</th><th style="padding: 10px;">Staking</th>
-                    </tr>
-                </thead>
-                <tbody>{lookahead_rows}</tbody>
-            </table>
-            <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid #1f2937; display: flex; justify-content: space-between; align-items: center;">
-                <p style="font-size: 15px; margin: 0;"><b>Governed Today Exposure:</b> <span style="color: #60a5fa;">{total_stake:.2f}u</span></p>
-                <a href="https://hova-syndicate-terminal.streamlit.app" style="background-color: #2563eb; color: #ffffff; text-decoration: none; padding: 8px 16px; border-radius: 4px; font-weight: bold; font-size: 13px;">Open Production Terminal</a>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = SENDER_EMAIL
-    msg["To"] = RECIPIENT_EMAIL
-    msg.attach(MIMEText(html_content, "html"))
-
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
-            server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        print(f"[✓] Multi-sport digest sent to {RECIPIENT_EMAIL}!")
-    except Exception as e:
-        print(f"[-] Email note: {e}")
 
 def apply_portfolio_risk_governor(recs_df, max_slate_exposure=6.0):
     if recs_df.empty or "suggested_stake" not in recs_df.columns:
@@ -317,7 +243,7 @@ def apply_portfolio_risk_governor(recs_df, max_slate_exposure=6.0):
     return recs_df, was_capped
 
 def run_pipeline():
-    print("[*] Ingesting multi-sport slate with strict live/past filtering...")
+    print("[*] Ingesting multi-sport slate (NHL, MLB, NFL, NCAAF)...")
     all_recs = extract_all_recommendations()
 
     if all_recs.empty:
@@ -332,7 +258,6 @@ def run_pipeline():
     balanced_lookahead = balance_multi_sport_board(lookahead_df, max_picks=6)
 
     governed_today, was_capped = apply_portfolio_risk_governor(balanced_today, MAX_DAILY_EXPOSURE_UNITS)
-    total_stake = governed_today["suggested_stake"].sum() if not governed_today.empty else 0.0
 
     print("[*] Writing cleaned board to Supabase...")
     requests.delete(f"{SUPABASE_URL}/rest/v1/bet_recommendations?id=neq.00000000-0000-0000-0000-000000000000", headers=HEADERS, timeout=8)
@@ -347,7 +272,6 @@ def run_pipeline():
     res = requests.post(f"{SUPABASE_URL}/rest/v1/bet_recommendations", headers=HEADERS, json=records, timeout=8)
     if res.status_code in [200, 201]:
         print(f"[✓] Committed {len(records)} clean plays to Supabase!")
-        send_morning_slate_email(governed_today, balanced_lookahead, total_stake, was_capped)
     else:
         print(f"[-] Supabase write error: {res.status_code} - {res.text}")
 
