@@ -26,4 +26,4 @@ socket.getaddrinfo = custom_getaddrinfo
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 
-TARGET_BOOKS = ["pinnacle", "circa", "draftkings", "fanduel", "betmgm", "caesars"]
+TARGET_BOOKS = ["draftkings", "fanduel", "betmgm", "caesars", "bet365", "ballybet", "hardrockbet", "fanatics", "betrivers", "espnbet", "novig", "betonlineag"]
