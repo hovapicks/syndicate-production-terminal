@@ -1,5 +1,6 @@
 ﻿import os
 import re
+import unicodedata
 import requests
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -24,26 +25,11 @@ ESPN_ENDPOINTS = {
     "EPL": "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard"
 }
 
-TEAM_ALIASES = {
-    "ARS": "ARS", "ARSENAL": "ARS",
-    "MCI": "MCI", "MAN CITY": "MCI", "MANCHESTER CITY": "MCI",
-    "LIV": "LIV", "LIVERPOOL": "LIV",
-    "CHE": "CHE", "CHELSEA": "CHE",
-    "MUN": "MUN", "MAN UTD": "MUN", "MANCHESTER UNITED": "MUN",
-    "TOT": "TOT", "SPURS": "TOT", "TOTTENHAM": "TOT",
-    "NEW": "NEW", "NEWCASTLE": "NEW", "NEWCASTLE UNITED": "NEW",
-    "AVL": "AVL", "ASTON VILLA": "AVL",
-    "BHA": "BHA", "BRIGHTON": "BHA",
-    "WHU": "WHU", "WEST HAM": "WHU",
-    "EVE": "EVE", "EVERTON": "EVE",
-    "FUL": "FUL", "FULHAM": "FUL",
-    "CRY": "CRY", "PALACE": "CRY", "CRYSTAL PALACE": "CRY",
-    "DRAW": "DRAW", "TIE": "DRAW"
-}
+def strip_accents(text):
+    return ''.join(c for c in unicodedata.normalize('NFD', str(text)) if unicodedata.category(c) != 'Mn')
 
-def normalize_token(text):
-    clean = re.sub(r"[^A-Za-z0-9]", "", str(text)).upper()
-    return TEAM_ALIASES.get(clean, clean)
+def clean_alphanumeric(text):
+    return re.sub(r"[^A-Za-z0-9]", "", strip_accents(text)).upper()
 
 def fetch_espn_scores(sport, days_back=2):
     endpoint = ESPN_ENDPOINTS.get(sport)
@@ -54,18 +40,19 @@ def fetch_espn_scores(sport, days_back=2):
     for d_offset in range(days_back + 1):
         target_date = (base_dt - timedelta(days=d_offset)).strftime("%Y%m%d")
         try:
-            r = requests.get(f"{endpoint}?dates={target_date}", timeout=6)
+            r = requests.get(f"{endpoint}?dates={target_date}", timeout=8)
             if r.status_code == 200:
                 events = r.json().get("events", [])
                 for ev in events:
-                    if ev.get("status", {}).get("type", {}).get("state") == "post":
+                    state = ev.get("status", {}).get("type", {}).get("state")
+                    if state == "post":
                         final_events.append(ev)
         except Exception:
             continue
     return final_events
 
 def parse_wager(pick_str, market_str):
-    raw = str(pick_str).strip()
+    raw = strip_accents(str(pick_str).strip())
     
     if "DRAW" in raw.upper() or "TIE" in raw.upper():
         return "DRAW", "DRAW", 0.0
@@ -74,7 +61,8 @@ def parse_wager(pick_str, market_str):
     if line_match and any(char in raw for char in ["+", "-"]):
         spread_val = float(line_match.group(1))
         team_part = raw[:line_match.start()].strip()
-        return "SPREAD", normalize_token(team_part), spread_val
+        team_part = re.sub(r"\s*\([^)]*\)", "", team_part).strip()
+        return "SPREAD", clean_alphanumeric(team_part), spread_val
 
     if "OVER" in raw.upper():
         total_val = float(re.search(r"(\d+\.?\d*)", raw).group(1))
@@ -84,48 +72,55 @@ def parse_wager(pick_str, market_str):
         return "UNDER", None, total_val
 
     team_clean = raw.upper().replace("MONEYLINE", "").replace("MATCH RESULT", "").replace("ML", "").strip()
-    return "ML", normalize_token(team_clean), 0.0
+    team_clean = re.sub(r"\s*\([^)]*\)", "", team_clean).strip()
+    return "ML", clean_alphanumeric(team_clean), 0.0
 
-def evaluate_ticket(event, bet_type, target_team, line_value):
+def matches_team(target_clean, comp_team):
+    candidates = [
+        comp_team.get("name", ""),
+        comp_team.get("location", ""),
+        comp_team.get("displayName", ""),
+        comp_team.get("shortDisplayName", ""),
+        comp_team.get("abbreviation", "")
+    ]
+    cleaned_candidates = [clean_alphanumeric(c) for c in candidates if c]
+    for c in cleaned_candidates:
+        if target_clean in c or c in target_clean:
+            return True
+    return False
+
+def evaluate_ticket(event, bet_type, target_clean, line_value):
     comps = event.get("competitions", [{}])[0].get("competitors", [])
     if len(comps) != 2: return None, None
 
     team_a = comps[0]
     team_b = comps[1]
 
-    abbr_a = team_a.get("team", {}).get("abbreviation", "").upper()
-    name_a = team_a.get("team", {}).get("name", "").upper()
     score_a = float(team_a.get("score", 0))
-
-    abbr_b = team_b.get("team", {}).get("abbreviation", "").upper()
-    name_b = team_b.get("team", {}).get("name", "").upper()
     score_b = float(team_b.get("score", 0))
 
-    score_str = f"{abbr_a} {int(score_a)} - {abbr_b} {int(score_b)}"
+    name_a = team_a.get("team", {}).get("shortDisplayName", team_a.get("team", {}).get("name", "Team A"))
+    name_b = team_b.get("team", {}).get("shortDisplayName", team_b.get("team", {}).get("name", "Team B"))
+    score_str = f"{name_a} {int(score_a)} - {name_b} {int(score_b)}"
 
     if bet_type == "DRAW":
         return ("WON" if score_a == score_b else "LOST"), score_str
 
-    if bet_type == "ML":
-        if target_team in [abbr_a, name_a, normalize_token(name_a)]:
-            picked_score, opp_score = score_a, score_b
-        elif target_team in [abbr_b, name_b, normalize_token(name_b)]:
-            picked_score, opp_score = score_b, score_a
-        else:
-            return None, None
+    is_a = matches_team(target_clean, team_a.get("team", {}))
+    is_b = matches_team(target_clean, team_b.get("team", {}))
 
+    if not is_a and not is_b:
+        return None, None
+
+    picked_score = score_a if is_a else score_b
+    opp_score = score_b if is_a else score_a
+
+    if bet_type == "ML":
         if picked_score > opp_score: return "WON", score_str
         elif picked_score < opp_score: return "LOST", score_str
-        else: return "LOST", score_str  # In 3-way markets, a draw results in a loss for moneyline bets
+        else: return "LOST", score_str
 
     elif bet_type == "SPREAD":
-        if target_team in [abbr_a, name_a, normalize_token(name_a)]:
-            picked_score, opp_score = score_a, score_b
-        elif target_team in [abbr_b, name_b, normalize_token(name_b)]:
-            picked_score, opp_score = score_b, score_a
-        else:
-            return None, None
-
         margin = (picked_score + line_value) - opp_score
         if margin > 0: return "WON", score_str
         elif margin < 0: return "LOST", score_str
@@ -159,7 +154,7 @@ def run_settlement():
     print(f"[*] Auditing {len(open_bets)} pending wagers against ESPN final box scores...")
 
     espn_cache = {
-        sport: fetch_espn_scores(sport) for sport in ESPN_ENDPOINTS.keys()
+        sport: fetch_espn_scores(sport, days_back=2) for sport in ESPN_ENDPOINTS.keys()
     }
 
     settled_count = 0
@@ -172,23 +167,45 @@ def run_settlement():
         market = bet.get("market", "")
         odds = int(bet.get("odds", -110))
         stake = float(bet.get("stake_units", 1.0))
+        created_at_str = bet.get("created_at")
 
-        bet_type, target_team, line_val = parse_wager(pick, market)
+        # Parse ticket placement timestamp
+        bet_dt = None
+        if created_at_str:
+            try:
+                bet_dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+            except Exception:
+                pass
+
+        bet_type, target_clean, line_val = parse_wager(pick, market)
         events = espn_cache.get(sport, [])
 
         matched_event = None
         for ev in events:
-            ev_name = ev.get("name", "").upper()
-            ev_short = ev.get("shortName", "").upper()
-            m_tokens = [normalize_token(t) for t in re.split(r"[@vV\s]+", matchup) if t]
-            if any(t in ev_name or t in ev_short for t in m_tokens):
+            ev_date_str = ev.get("date")
+            if ev_date_str and bet_dt:
+                try:
+                    ev_dt = datetime.fromisoformat(ev_date_str.replace("Z", "+00:00"))
+                    # The game must have started AFTER or within 4 hours prior to bet creation
+                    # (Strictly rejects yesterday's game in a multi-game series)
+                    time_diff = (ev_dt - bet_dt).total_seconds()
+                    if time_diff < -14400:  # Event started >4 hours before the bet was even created
+                        continue
+                except Exception:
+                    pass
+
+            ev_name = clean_alphanumeric(ev.get("name", ""))
+            ev_short = clean_alphanumeric(ev.get("shortName", ""))
+            
+            teams_in_matchup = [clean_alphanumeric(t) for t in re.split(r"[@vV]+", matchup) if t.strip()]
+            if any(t in ev_name or t in ev_short for t in teams_in_matchup):
                 matched_event = ev
                 break
 
         if not matched_event:
             continue
 
-        result_status, score_str = evaluate_ticket(matched_event, bet_type, target_team, line_val)
+        result_status, score_str = evaluate_ticket(matched_event, bet_type, target_clean, line_val)
         if not result_status:
             continue
 
