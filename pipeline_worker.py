@@ -49,7 +49,6 @@ def fetch_market_odds(sport_key):
 def extract_all_recommendations():
     recommendations = []
     
-    # Isolated strictly to NHL for hardening phase
     sports_map = {
         "NHL": "icehockey_nhl",
         # "MLB": "baseball_mlb",
@@ -59,7 +58,8 @@ def extract_all_recommendations():
     }
 
     now_utc = datetime.now(timezone.utc)
-    cutoff_30h = now_utc + timedelta(hours=30)
+    # Strictly lock window to tonight's games (next 10 hours)
+    cutoff_today = now_utc + timedelta(hours=10)
 
     for sport_label, sport_key in sports_map.items():
         events = fetch_market_odds(sport_key)
@@ -71,7 +71,8 @@ def extract_all_recommendations():
             if commence_time_str:
                 try:
                     c_dt = datetime.fromisoformat(commence_time_str.replace("Z", "+00:00"))
-                    if c_dt <= now_utc or c_dt > cutoff_30h:
+                    # Drop completed or in-progress games, and skip tomorrow's games entirely
+                    if c_dt <= now_utc or c_dt > cutoff_today:
                         continue
                 except Exception:
                     continue
@@ -85,7 +86,6 @@ def extract_all_recommendations():
                     if m_key not in market_buckets: continue
                     outcomes = mkt.get("outcomes", [])
                     
-                    # Strictly 2-way OT-inclusive outcomes (eliminates 3-way 60-min regulation lines)
                     if len(outcomes) != 2: continue
 
                     prices = [o.get("price", 0) for o in outcomes]
@@ -190,11 +190,13 @@ def apply_portfolio_risk_governor(recs_df, max_slate_exposure=6.0):
     return recs_df, was_capped
 
 def run_pipeline():
-    print("[*] Ingesting NHL daily slate...")
+    print("[*] Ingesting tonight's active NHL slate...")
     df = extract_all_recommendations()
 
     if df.empty:
-        print("[-] Notice: No qualifying NHL edges detected for upcoming games.")
+        print("[-] Notice: No qualifying NHL edges detected for tonight's games.")
+        # Clear out previous stale rows
+        requests.delete(f"{SUPABASE_URL}/rest/v1/bet_recommendations?id=neq.00000000-0000-0000-0000-000000000000", headers=HEADERS, timeout=8)
         return
 
     df = filter_unique_teams(df)
@@ -211,7 +213,7 @@ def run_pipeline():
 
     res = requests.post(f"{SUPABASE_URL}/rest/v1/bet_recommendations", headers=HEADERS, json=records, timeout=8)
     if res.status_code in [200, 201]:
-        print(f"[✓] Committed {len(records)} clean NHL plays to Supabase!")
+        print(f"[✓] Committed {len(records)} tonight-only NHL plays to Supabase!")
     else:
         print(f"[-] Supabase write error: {res.status_code} - {res.text}")
 
