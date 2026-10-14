@@ -152,7 +152,7 @@ with tab_recs:
                 st.write("### Stage Pick to Ledger")
                 st_data = st.session_state["staging_row"]
                 col_in1, col_in2, col_in3 = st.columns(3)
-                bm = col_in1.selectbox("Bookmaker", ["DraftKings", "FanDuel", "BetMGM", "Caesars", "Pinnacle", "Circa"])
+                bm = col_in1.selectbox("Bookmaker", ["DraftKings", "FanDuel", "BetMGM", "Caesars", "Pinnacle", "Circa", "Novig", "BetRivers", "ESPN BET"])
                 stk = col_in2.number_input("Confirmed Units", value=float(st_data.get("suggested_stake", 1.0)), step=0.1)
                 commit_btn = col_in3.button("✅ Commit to Ledger", type="primary", use_container_width=True)
                 
