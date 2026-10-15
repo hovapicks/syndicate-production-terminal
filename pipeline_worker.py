@@ -59,7 +59,7 @@ def extract_all_recommendations():
 
     now_utc = datetime.now(timezone.utc)
     # Strictly lock window to tonight's games (next 10 hours)
-    cutoff_today = now_utc + timedelta(hours=10)
+    cutoff_today = now_utc + timedelta(hours=18)
 
     for sport_label, sport_key in sports_map.items():
         events = fetch_market_odds(sport_key)
