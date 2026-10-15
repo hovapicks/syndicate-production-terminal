@@ -11,10 +11,15 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "https://btzzkdjnijzzdqvjnomr.supabase.
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 MAX_DAILY_EXPOSURE_UNITS = float(os.getenv("MAX_DAILY_EXPOSURE_UNITS", "6.0"))
 
-ODDS_API_KEYS = [
-    val for k, val in sorted(os.environ.items(), key=lambda x: int(x[0].split('_')[-1]) if x[0].split('_')[-1].isdigit() else 99)
-    if k.startswith("ODDS_API_KEY_") and val
-]
+# Support comma-separated secret OR individual numbered env vars
+raw_keys = os.getenv("ODDS_API_KEYS", "")
+if raw_keys:
+    ODDS_API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
+else:
+    ODDS_API_KEYS = [
+        val for k, val in sorted(os.environ.items(), key=lambda x: int(x[0].split('_')[-1]) if x[0].split('_')[-1].isdigit() else 99)
+        if k.startswith("ODDS_API_KEY_") and val
+    ]
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
